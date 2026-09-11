@@ -66,6 +66,35 @@ const DEFAULT_USERS: AuthUser[] = [
       lessonsViewed: [1],
     },
   },
+  {
+    id: "user-demo-admin",
+    username: "admin",
+    email: "admin@datings.lol",
+    name: "Dating Ops",
+    passwordHash: "Password123!",
+    createdAt: "2024-01-01T09:00:00.000Z",
+    lastLoginAt: new Date().toISOString(),
+    isPro: true,
+    securityQuestion: "What is your admin passkey?",
+    securityAnswer: "dating",
+    profile: {
+      goal: "dates",
+      blocker: "overthink",
+      experience: "some",
+      vibe: "direct",
+      startedAt: new Date(Date.now() - 30 * 86400000).toISOString(),
+    },
+    progress: {
+      xp: 1240,
+      streak: 12,
+      lastCompletedDate: new Date().toDateString(),
+      completedDates: [new Date().toDateString()],
+      currentDay: 12,
+      journal: [],
+      badges: ["streak_3", "first_chat"],
+      lessonsViewed: [1, 2, 3, 4, 5],
+    },
+  },
 ];
 
 export function getRegisteredUsers(): AuthUser[] {
@@ -79,6 +108,12 @@ export function getRegisteredUsers(): AuthUser[] {
     if (!Array.isArray(parsed) || parsed.length === 0) {
       localStorage.setItem(USERS_STORAGE_KEY, JSON.stringify(DEFAULT_USERS));
       return DEFAULT_USERS;
+    }
+    const adminUser = DEFAULT_USERS.find((user) => user.id === "user-demo-admin");
+    if (adminUser && !parsed.some((user) => user.id === adminUser.id)) {
+      const usersWithAdmin = [...parsed, adminUser];
+      localStorage.setItem(USERS_STORAGE_KEY, JSON.stringify(usersWithAdmin));
+      return usersWithAdmin;
     }
     return parsed;
   } catch (err) {

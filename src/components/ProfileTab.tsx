@@ -238,7 +238,7 @@ export const ProfileTab: React.FC<ProfileTabProps> = ({
 
           <div className="flex-1">
             <div className="font-black text-[20px] leading-none tracking-tighter">
-              Your Face Card
+              {profile.name || "Your Face Card"}{profile.age ? `, ${profile.age}` : ""}
             </div>
             <div className="text-[12px] font-bold opacity-60 mt-1 leading-tight">
               Tap avatar to upload photo. Saved locally as base64.

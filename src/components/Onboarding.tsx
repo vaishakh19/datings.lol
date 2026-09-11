@@ -9,6 +9,8 @@ interface OnboardingProps {
 export const Onboarding: React.FC<OnboardingProps> = ({ onComplete }) => {
   const [stepIndex, setStepIndex] = useState(0);
   const [answers, setAnswers] = useState<Record<string, string>>({});
+  const [name, setName] = useState("");
+  const [age, setAge] = useState("");
   const [selectedOption, setSelectedOption] = useState<string | null>(null);
 
   const steps = [
@@ -52,16 +54,26 @@ export const Onboarding: React.FC<OnboardingProps> = ({ onComplete }) => {
     },
   ];
 
-  const currentStep = steps[stepIndex] || steps[0];
+  const isIdentityStep = stepIndex === 0;
+  const currentStep = steps[stepIndex - 1] || steps[0];
 
   const handleNext = () => {
+    if (isIdentityStep) {
+      const numericAge = Number(age);
+      if (!name.trim() || !Number.isInteger(numericAge) || numericAge < 18 || numericAge > 120) return;
+      setStepIndex(1);
+      return;
+    }
+
     if (!selectedOption) return;
     const newAnswers = { ...answers, [currentStep.key]: selectedOption };
     setAnswers(newAnswers);
     setSelectedOption(null);
 
-    if (stepIndex >= steps.length - 1) {
+    if (stepIndex >= steps.length) {
       onComplete({
+        name: name.trim(),
+        age: Number(age),
         goal: newAnswers.goal || "dates",
         blocker: newAnswers.blocker || "shy",
         experience: newAnswers.experience || "new",
@@ -86,7 +98,7 @@ export const Onboarding: React.FC<OnboardingProps> = ({ onComplete }) => {
           </span>
         </div>
         <div className="text-[12px] font-bold px-3 py-1 bg-white border-[2px] border-black rounded-full">
-          step {stepIndex + 1}/{steps.length}
+          step {stepIndex + 1}/{steps.length + 1}
         </div>
       </div>
 
@@ -94,20 +106,49 @@ export const Onboarding: React.FC<OnboardingProps> = ({ onComplete }) => {
       <div className="w-full max-w-[480px] h-[8px] bg-white border-[2px] border-black rounded-full overflow-hidden mb-10">
         <div
           className="h-full bg-[#111] transition-all duration-500"
-          style={{ width: `${((stepIndex + 1) / steps.length) * 100}%` }}
+          style={{ width: `${((stepIndex + 1) / (steps.length + 1)) * 100}%` }}
         />
       </div>
 
       {/* Step Question & Cards */}
       <div className="w-full max-w-[480px] flex-1">
         <h1 className="text-[36px] font-black leading-[0.95] tracking-tighter mb-2">
-          {currentStep.q}
+          {isIdentityStep ? "Let's get to know you" : currentStep.q}
         </h1>
         <p className="text-[16px] font-medium opacity-60 mb-8">
           We’ll tailor everything to you. No cap.
         </p>
 
-        <div className="grid gap-3">
+        {isIdentityStep ? (
+          <div className="space-y-4">
+            <div>
+              <label className="block text-[12px] font-black uppercase tracking-widest mb-1.5">Your name</label>
+              <input
+                value={name}
+                onChange={(e) => setName(e.target.value)}
+                maxLength={40}
+                placeholder="What should we call you?"
+                autoComplete="name"
+                className="w-full h-14 px-4 bg-white border-[3px] border-black rounded-[18px] font-black text-[16px] outline-none focus:ring-2 focus:ring-[#FFE066]"
+              />
+            </div>
+            <div>
+              <label className="block text-[12px] font-black uppercase tracking-widest mb-1.5">Your age</label>
+              <input
+                value={age}
+                onChange={(e) => setAge(e.target.value.replace(/\D/g, "").slice(0, 3))}
+                type="text"
+                inputMode="numeric"
+                maxLength={3}
+                placeholder="18+"
+                autoComplete="bday-year"
+                className="w-full h-14 px-4 bg-white border-[3px] border-black rounded-[18px] font-black text-[16px] outline-none focus:ring-2 focus:ring-[#FFE066]"
+              />
+              <p className="text-[11px] font-bold opacity-50 mt-1.5">You must be 18 or older to use datings.lol.</p>
+            </div>
+          </div>
+        ) : (
+          <div className="grid gap-3">
           {currentStep.options.map((opt) => {
             const isSelected = selectedOption === opt.id;
             return (
@@ -157,19 +198,20 @@ export const Onboarding: React.FC<OnboardingProps> = ({ onComplete }) => {
               </button>
             );
           })}
-        </div>
+          </div>
+        )}
 
         {/* Continue Button */}
         <button
           onClick={handleNext}
-          disabled={!selectedOption}
+          disabled={isIdentityStep ? !name.trim() || Number(age) < 18 : !selectedOption}
           className={`mt-6 w-full h-[52px] rounded-full border-[3px] border-black font-black text-[15px] uppercase tracking-wide flex items-center justify-center gap-2 transition-all ${
             selectedOption
               ? "bg-[#FFE066] text-black brutal-shadow translate-y-[-2px] hover:translate-y-[-1px]"
               : "bg-white text-black/30"
           }`}
         >
-          {stepIndex === steps.length - 1 ? "Start my glow-up" : "Continue"}
+          {stepIndex === steps.length ? "Start my glow-up" : "Continue"}
           <ArrowRight size={18} strokeWidth={3} />
         </button>
       </div>

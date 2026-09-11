@@ -1,5 +1,5 @@
 import React, { useState, useEffect, useRef } from "react";
-import { UserProfile, UserProgress, ChatMessage, AuthUser, AuthView } from "./types";
+import { UserProfile, UserProgress, ChatMessage, AuthUser, AuthView, AdminSettings, AppTab } from "./types";
 import { LESSONS } from "./data/lessons";
 import { Onboarding } from "./components/Onboarding";
 import { Header } from "./components/Header";
@@ -7,15 +7,23 @@ import { Navigation } from "./components/Navigation";
 import { TodayTab } from "./components/TodayTab";
 import { CoachTab } from "./components/CoachTab";
 import { ProfileTab } from "./components/ProfileTab";
+import { AdminTab } from "./components/AdminTab";
+import { CommunityTab } from "./components/CommunityTab";
 import { ProModal } from "./components/ProModal";
 import { HotTakeModal } from "./components/HotTakeModal";
 import { AuthContainer } from "./components/auth/AuthContainer";
-import { getTodayHotTake, HotTake } from "./data/hotTakes";
+import { getTodayHotTake } from "./data/hotTakes";
 import {
   getCurrentUser,
   setCurrentUser as saveCurrentUser,
   updateCurrentUserData,
 } from "./utils/authStorage";
+import {
+  getActiveAdminNotification,
+  getAdminSettings,
+  isAdminUser,
+  saveAdminSettings,
+} from "./utils/adminStorage";
 
 const MAX_FREE_CHATS = 3;
 
@@ -48,7 +56,17 @@ export default function App() {
     );
   });
 
-  const [activeTab, setActiveTab] = useState<"today" | "coach" | "profile">("today");
+  const [activeTab, setActiveTab] = useState<AppTab>(() =>
+    window.location.pathname === "/admin" ? "admin" : "today"
+  );
+  const [adminSettings, setAdminSettings] = useState<AdminSettings>(() => getAdminSettings());
+  const [dismissedNotificationIds, setDismissedNotificationIds] = useState<string[]>(() => {
+    try {
+      return JSON.parse(localStorage.getItem("datings_dismissed_notifications") || "[]");
+    } catch {
+      return [];
+    }
+  });
   const [messages, setMessages] = useState<ChatMessage[]>([
     {
       id: "1",
@@ -77,7 +95,6 @@ export default function App() {
 
   // Daily Hot Take state
   const [showHotTakeModal, setShowHotTakeModal] = useState(false);
-  const [todayHotTake] = useState<HotTake>(getTodayHotTake());
 
   // Theme state: "light" (Brutalist Light) vs "dark" (High-contrast Neon Dark)
   const [theme, setTheme] = useState<"light" | "dark">(() => {
@@ -95,6 +112,16 @@ export default function App() {
     }
     localStorage.setItem("datings_theme", theme);
   }, [theme]);
+
+  useEffect(() => {
+    const refreshAdminSettings = () => setAdminSettings(getAdminSettings());
+    window.addEventListener("storage", refreshAdminSettings);
+    window.addEventListener("datings_admin_settings_updated", refreshAdminSettings);
+    return () => {
+      window.removeEventListener("storage", refreshAdminSettings);
+      window.removeEventListener("datings_admin_settings_updated", refreshAdminSettings);
+    };
+  }, []);
 
   const toggleTheme = () => {
     setTheme((prev) => (prev === "dark" ? "light" : "dark"));
@@ -220,9 +247,38 @@ export default function App() {
         progress: progress,
         avatarUrl: avatarUrl || undefined,
         isPro: isPro,
+        messages,
       });
     }
-  }, [currentUser, profile, progress, avatarUrl, isPro]);
+  }, [currentUser, profile, progress, avatarUrl, isPro, messages]);
+
+  const adminAllowed = isAdminUser(currentUser);
+
+  useEffect(() => {
+    const handleRouteChange = () => {
+      setActiveTab(window.location.pathname === "/admin" ? "admin" : "today");
+    };
+
+    window.addEventListener("popstate", handleRouteChange);
+    return () => window.removeEventListener("popstate", handleRouteChange);
+  }, []);
+
+  useEffect(() => {
+    if (activeTab === "admin" && !adminAllowed) {
+      if (window.location.pathname === "/admin") {
+        window.history.replaceState({}, "", "/");
+      }
+      setActiveTab("today");
+    }
+  }, [activeTab, adminAllowed]);
+
+  const handleSelectTab = (tab: AppTab) => {
+    setActiveTab(tab);
+    const nextPath = tab === "admin" ? "/admin" : "/";
+    if (window.location.pathname !== nextPath) {
+      window.history.pushState({}, "", nextPath);
+    }
+  };
 
   const handleAuthSuccess = (user: AuthUser) => {
     setCurrentUser(user);
@@ -280,7 +336,9 @@ export default function App() {
   });
 
   const currentLesson =
-    filteredLessons[Math.min(currentDay - 1, filteredLessons.length - 1)] || LESSONS[0];
+    LESSONS.find((lesson) => lesson.id === adminSettings.dailyOverride.lessonId) ||
+    filteredLessons[Math.min(currentDay - 1, filteredLessons.length - 1)] ||
+    LESSONS[0];
   const nextLesson =
     filteredLessons[Math.min(currentDay, filteredLessons.length - 1)] || LESSONS[1];
 
@@ -486,6 +544,23 @@ export default function App() {
     ]);
   };
 
+  const handleSaveAdminSettings = (settings: AdminSettings) => {
+    saveAdminSettings(settings);
+    setAdminSettings(settings);
+  };
+
+  const activeAdminNotification = getActiveAdminNotification(adminSettings);
+  const todayHotTake = adminSettings.dailyHotTake || getTodayHotTake();
+  const shouldShowAdminNotification =
+    activeAdminNotification && !dismissedNotificationIds.includes(activeAdminNotification.id);
+
+  const handleDismissAdminNotification = () => {
+    if (!activeAdminNotification) return;
+    const nextDismissedIds = [...new Set([...dismissedNotificationIds, activeAdminNotification.id])];
+    setDismissedNotificationIds(nextDismissedIds);
+    localStorage.setItem("datings_dismissed_notifications", JSON.stringify(nextDismissedIds));
+  };
+
   const handleUpgradeToPro = () => {
     setIsPro(true);
     setShowProModal(false);
@@ -588,7 +663,7 @@ export default function App() {
       <Header
         progress={progress}
         avatarUrl={avatarUrl}
-        onOpenProfile={() => setActiveTab("profile")}
+            onOpenProfile={() => handleSelectTab("profile")}
         theme={theme}
         onToggleTheme={toggleTheme}
         currentUser={currentUser}
@@ -599,6 +674,47 @@ export default function App() {
 
       {/* Main Tab Content */}
       <main className="max-w-[640px] mx-auto px-4 pb-[100px] pt-6">
+        {shouldShowAdminNotification && activeAdminNotification && (
+          <div className="mb-5 bg-white border-[3px] border-black rounded-[20px] p-4 brutal-shadow-sm animate-[pop_0.25s_ease-out]">
+            <div className="flex items-start justify-between gap-3">
+              <div className="flex items-start gap-3">
+                <div
+                  className="w-10 h-10 rounded-full border-[2.5px] border-black flex items-center justify-center font-black text-[16px] shrink-0"
+                  style={{
+                    background:
+                      activeAdminNotification.tone === "warning"
+                        ? "#FDA4AF"
+                        : activeAdminNotification.tone === "win"
+                        ? "#BEF264"
+                        : "#FFE066",
+                  }}
+                >
+                  !
+                </div>
+                <div>
+                  <div className="text-[10px] font-black uppercase tracking-widest opacity-60">
+                    Admin Broadcast
+                  </div>
+                  <h3 className="font-black text-[16px] leading-tight text-[#111]">
+                    {activeAdminNotification.title}
+                  </h3>
+                  <p className="text-[12px] font-bold opacity-70 leading-snug mt-1">
+                    {activeAdminNotification.message}
+                  </p>
+                </div>
+              </div>
+              <button
+                type="button"
+                onClick={handleDismissAdminNotification}
+                className="w-8 h-8 bg-[#FFFBEB] border-[2px] border-black rounded-full font-black text-[13px] shrink-0"
+                title="Dismiss broadcast"
+              >
+                X
+              </button>
+            </div>
+          </div>
+        )}
+
         {activeTab === "today" && (
           <TodayTab
             currentDay={currentDay}
@@ -611,6 +727,8 @@ export default function App() {
             onUpdateDailyFocus={handleUpdateDailyFocus}
             onOpenHotTake={() => setShowHotTakeModal(true)}
             todayHotTakeTopic={todayHotTake.topic}
+            adminFocus={adminSettings.dailyOverride.focus}
+            adminNote={adminSettings.dailyOverride.note}
           />
         )}
 
@@ -627,6 +745,14 @@ export default function App() {
           />
         )}
 
+        {activeTab === "community" && (
+          <CommunityTab
+            settings={adminSettings}
+            isAdmin={adminAllowed}
+            onOpenAdmin={() => handleSelectTab("admin")}
+          />
+        )}
+
         {activeTab === "profile" && (
           <ProfileTab
             profile={profile}
@@ -639,7 +765,7 @@ export default function App() {
             isPro={isPro}
             onOpenProModal={() => setShowProModal(true)}
             onResetData={handleResetData}
-            onOpenCoachTab={() => setActiveTab("coach")}
+            onOpenCoachTab={() => handleSelectTab("coach")}
             chatsUsedToday={chatsUsedToday}
             maxFreeChats={MAX_FREE_CHATS}
             onDowngradeToFree={() => {
@@ -653,10 +779,21 @@ export default function App() {
             onOpenAuth={handleOpenAuth}
           />
         )}
+
+        {activeTab === "admin" && adminAllowed && (
+          <AdminTab
+            settings={adminSettings}
+            onSaveSettings={handleSaveAdminSettings}
+          />
+        )}
       </main>
 
       {/* Bottom Navigation */}
-      <Navigation activeTab={activeTab} onSelectTab={setActiveTab} />
+      <Navigation
+        activeTab={activeTab}
+        onSelectTab={handleSelectTab}
+        showAdmin={adminAllowed && window.location.pathname === "/admin"}
+      />
     </div>
   );
 }

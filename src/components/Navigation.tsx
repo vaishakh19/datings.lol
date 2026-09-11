@@ -1,19 +1,26 @@
 import React from "react";
-import { Calendar, MessageCircle, User } from "lucide-react";
+import { Calendar, MessageCircle, ShieldCheck, Users, User } from "lucide-react";
+import { AppTab } from "../types";
 
 interface NavigationProps {
-  activeTab: "today" | "coach" | "profile";
-  onSelectTab: (tab: "today" | "coach" | "profile") => void;
+  activeTab: AppTab;
+  onSelectTab: (tab: AppTab) => void;
+  showAdmin?: boolean;
 }
 
 export const Navigation: React.FC<NavigationProps> = ({
   activeTab,
   onSelectTab,
+  showAdmin = false,
 }) => {
   const navItems = [
     { id: "today", label: "Today", icon: Calendar, activeColor: "#FFE066" },
     { id: "coach", label: "Coach", icon: MessageCircle, activeColor: "#A78BFA" },
+    { id: "community", label: "Community", icon: Users, activeColor: "#FDA4AF" },
     { id: "profile", label: "Profile", icon: User, activeColor: "#BEF264" },
+    ...(showAdmin
+      ? [{ id: "admin" as const, label: "Admin", icon: ShieldCheck, activeColor: "#FDA4AF" }]
+      : []),
   ] as const;
 
   return (

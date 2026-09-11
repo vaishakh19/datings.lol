@@ -27,6 +27,8 @@ interface TodayTabProps {
   onUpdateDailyFocus?: (focus: string) => void;
   onOpenHotTake?: () => void;
   todayHotTakeTopic?: string;
+  adminFocus?: string;
+  adminNote?: string;
 }
 
 export const TodayTab: React.FC<TodayTabProps> = ({
@@ -39,6 +41,8 @@ export const TodayTab: React.FC<TodayTabProps> = ({
   onUpdateDailyFocus,
   onOpenHotTake,
   todayHotTakeTopic,
+  adminFocus,
+  adminNote,
 }) => {
   const [reflection, setReflection] = useState("");
   const [readChecked, setReadChecked] = useState(false);
@@ -46,13 +50,14 @@ export const TodayTab: React.FC<TodayTabProps> = ({
 
   // Daily focus state
   const [isEditingFocus, setIsEditingFocus] = useState(false);
-  const [focusInput, setFocusInput] = useState(progress.dailyFocus || "");
+  const activeDailyFocus = adminFocus || progress.dailyFocus || "";
+  const [focusInput, setFocusInput] = useState(activeDailyFocus);
 
   useEffect(() => {
-    if (progress.dailyFocus !== undefined) {
-      setFocusInput(progress.dailyFocus);
+    if (activeDailyFocus !== undefined) {
+      setFocusInput(activeDailyFocus);
     }
-  }, [progress.dailyFocus]);
+  }, [activeDailyFocus]);
 
   const handleSaveFocus = (e?: React.FormEvent) => {
     if (e) e.preventDefault();
@@ -252,7 +257,25 @@ export const TodayTab: React.FC<TodayTabProps> = ({
       </div>
 
       {/* Daily Focus Section */}
-      {progress.dailyFocus && !isEditingFocus ? (
+      {adminNote && (
+        <div className="bg-[#BEF264] border-[3px] border-black rounded-[20px] p-4 brutal-shadow-sm">
+          <div className="flex items-start gap-3">
+            <div className="w-9 h-9 rounded-full bg-black text-[#BEF264] flex items-center justify-center shrink-0 border-[2px] border-black font-black text-[13px]">
+              !
+            </div>
+            <div>
+              <span className="text-[10px] font-black uppercase tracking-widest text-black/70">
+                Admin Note
+              </span>
+              <p className="font-black text-[14px] leading-snug text-[#111] mt-0.5">
+                {adminNote}
+              </p>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {activeDailyFocus && !isEditingFocus ? (
         <div className="bg-[#FFE066] border-[3px] border-black rounded-[20px] p-4 brutal-shadow-sm transition-all">
           <div className="flex items-start justify-between gap-3">
             <div className="flex items-start gap-3">
@@ -267,14 +290,14 @@ export const TodayTab: React.FC<TodayTabProps> = ({
                   <span className="w-2 h-2 rounded-full bg-black animate-pulse" />
                 </div>
                 <p className="font-black text-[16px] leading-snug text-[#111] mt-0.5">
-                  "{progress.dailyFocus}"
+                  "{activeDailyFocus}"
                 </p>
               </div>
             </div>
 
             <button
               onClick={() => {
-                setFocusInput(progress.dailyFocus || "");
+                setFocusInput(activeDailyFocus);
                 setIsEditingFocus(true);
               }}
               className="text-[11px] font-black uppercase px-2.5 py-1 rounded-full border-[2px] border-black bg-white hover:bg-black hover:text-white transition-colors flex items-center gap-1 shrink-0 brutal-shadow-sm"
@@ -295,7 +318,7 @@ export const TodayTab: React.FC<TodayTabProps> = ({
                 Set Your Daily Dating Focus
               </span>
             </div>
-            {progress.dailyFocus && (
+            {activeDailyFocus && (
               <button
                 type="button"
                 onClick={() => setIsEditingFocus(false)}

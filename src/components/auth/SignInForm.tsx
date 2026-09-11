@@ -474,6 +474,27 @@ export const SignInForm: React.FC<SignInFormProps> = ({
               Fill
             </span>
           </button>
+
+          <button
+            type="button"
+            onClick={() => handleFillDemo("admin")}
+            className="p-2.5 text-left bg-[#FDA4AF] dark:bg-[#3A171C] border-[2px] border-black rounded-lg hover:bg-[#FB7185] dark:hover:bg-[#512027] transition-colors flex items-center justify-between text-[12px] group cursor-pointer sm:col-span-2"
+          >
+            <div>
+              <span className="font-black text-black dark:text-white block flex items-center gap-1.5">
+                Admin Control
+                <span className="text-[9px] uppercase tracking-wider bg-white/70 dark:bg-black/30 px-1.5 py-0.5 rounded-full border border-black/30">
+                  Staff
+                </span>
+              </span>
+              <span className="text-black/70 dark:text-white/70 font-mono text-[11px]">
+                @admin · operations panel access
+              </span>
+            </div>
+            <span className="text-[10px] font-bold px-2 py-0.5 bg-white text-black border-[1.5px] border-black rounded-full group-hover:scale-105 transition-transform">
+              Fill
+            </span>
+          </button>
         </div>
       </div>
 

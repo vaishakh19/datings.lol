@@ -1,4 +1,5 @@
 export type AuthView = "signin" | "signup" | "forgot_password" | "forgot_username";
+export type AppTab = "today" | "coach" | "community" | "profile" | "admin";
 
 export interface AuthUser {
   id: string;
@@ -17,7 +18,48 @@ export interface AuthUser {
   messages?: ChatMessage[];
 }
 
+export interface AdminNotification {
+  id: string;
+  title: string;
+  message: string;
+  tone: "update" | "warning" | "win";
+  createdAt: string;
+  expiresAt?: string;
+  isActive: boolean;
+}
+
+export interface AdminDailyOverride {
+  lessonId: number | null;
+  focus: string;
+  note: string;
+  updatedAt: string;
+}
+
+export interface AdminHotTakeOverride {
+  topic: string;
+  statement: string;
+  subtext: string;
+  agreePercent: number;
+  disagreePercent: number;
+  complicatedPercent: number;
+  coachInsight: {
+    agree: string;
+    disagree: string;
+    complicated: string;
+  };
+  bonusXp: number;
+  updatedAt: string;
+}
+
+export interface AdminSettings {
+  notifications: AdminNotification[];
+  dailyOverride: AdminDailyOverride;
+  dailyHotTake: AdminHotTakeOverride | null;
+}
+
 export interface UserProfile {
+  name?: string;
+  age?: number;
   goal: string;
   blocker: string;
   experience: string;
