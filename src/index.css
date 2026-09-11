@@ -1,0 +1,217 @@
+@import "tailwindcss";
+@import url('https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@500;700;900&display=swap');
+
+* {
+  font-family: 'Space Grotesk', system-ui, sans-serif;
+}
+
+.brutal-shadow {
+  box-shadow: 4px 4px 0px 0px #111;
+}
+
+.brutal-shadow-sm {
+  box-shadow: 3px 3px 0px 0px #111;
+}
+
+.scrollbar-none::-webkit-scrollbar {
+  display: none;
+}
+
+.scrollbar-none {
+  -ms-overflow-style: none;
+  scrollbar-width: none;
+}
+
+/* ===================================================
+   HIGH-CONTRAST DARK MODE (Black canvas + Neon Yellow)
+   =================================================== */
+html.dark {
+  background-color: #050505;
+  color-scheme: dark;
+}
+
+html.dark body {
+  background-color: #050505;
+  color: #F3F4F6;
+}
+
+html.dark .brutal-shadow {
+  box-shadow: 4px 4px 0px 0px #FFE066 !important;
+}
+
+html.dark .brutal-shadow-sm {
+  box-shadow: 3px 3px 0px 0px #FFE066 !important;
+}
+
+/* Canvas & Card background overrides */
+html.dark .bg-\[\#FFFBEB\] {
+  background-color: #0D0D0D !important;
+}
+
+html.dark .bg-white {
+  background-color: #161616 !important;
+}
+
+html.dark .border-black {
+  border-color: #383838 !important;
+}
+
+html.dark .text-\[\#111\],
+html.dark .text-black {
+  color: #F3F4F6 !important;
+}
+
+html.dark header {
+  background-color: rgba(10, 10, 10, 0.95) !important;
+  border-bottom-color: #FFE066 !important;
+}
+
+html.dark nav {
+  background-color: #0A0A0A !important;
+  border-top-color: #FFE066 !important;
+}
+
+html.dark nav button {
+  border-color: #444 !important;
+}
+
+html.dark input,
+html.dark textarea {
+  background-color: #1A1A1A !important;
+  color: #FFFFFF !important;
+  border-color: #FFE066 !important;
+}
+
+/* Ensure Neon Yellow cards & badges retain punchy contrast */
+html.dark .bg-\[\#FFE066\] {
+  background-color: #FFE066 !important;
+  color: #050505 !important;
+}
+
+html.dark .bg-\[\#FFE066\] *,
+html.dark .bg-\[\#BEF264\] *,
+html.dark .bg-\[\#4ADE80\] * {
+  color: #050505 !important;
+}
+
+html.dark .bg-\[\#BEF264\] {
+  background-color: #BEF264 !important;
+  color: #050505 !important;
+}
+
+html.dark .bg-\[\#4ADE80\] {
+  background-color: #4ADE80 !important;
+  color: #050505 !important;
+}
+
+/* Good move vs Trash move cards in dark mode */
+html.dark .bg-\[\#F0FDF4\] {
+  background-color: #0A2413 !important;
+  color: #86EFAC !important;
+  border-color: #22C55E !important;
+}
+
+html.dark .bg-\[\#FEF2F2\] {
+  background-color: #2A0E0E !important;
+  color: #FCA5A5 !important;
+  border-color: #EF4444 !important;
+}
+
+/* Reminder Banner in dark mode */
+html.dark .bg-\[\#FEF08A\] {
+  background-color: #1C1906 !important;
+  border-color: #FFE066 !important;
+}
+
+html.dark .bg-\[\#FEF08A\] h4 {
+  color: #FFFFFF !important;
+}
+
+html.dark .bg-\[\#FEF08A\] p {
+  color: #D1D5DB !important;
+}
+
+/* Invert black buttons to solid dark surfaces with neon accents */
+html.dark button.bg-\[\#111\],
+html.dark div.bg-\[\#111\] {
+  border-color: #FFE066 !important;
+}
+
+@keyframes bounce {
+  0%, 100% {
+    transform: translateY(0);
+  }
+  50% {
+    transform: translateY(-4px);
+  }
+}
+
+@keyframes confetti {
+  0% {
+    transform: translateY(0) rotate(0deg) scale(1);
+    opacity: 1;
+  }
+  100% {
+    transform: translateY(100vh) rotate(720deg) scale(0);
+    opacity: 0;
+  }
+}
+
+@keyframes pop {
+  0% {
+    transform: scale(0.8);
+    opacity: 0;
+  }
+  100% {
+    transform: scale(1);
+    opacity: 1;
+  }
+}
+
+/* Screen shake for tactile brutalist completions */
+@keyframes brutal-screen-shake {
+  0%, 100% {
+    transform: translate3d(0, 0, 0) rotate(0deg);
+  }
+  15% {
+    transform: translate3d(-3.5px, 2px, 0) rotate(-0.4deg);
+  }
+  30% {
+    transform: translate3d(3.5px, -2px, 0) rotate(0.4deg);
+  }
+  45% {
+    transform: translate3d(-2.5px, -1.5px, 0) rotate(-0.25deg);
+  }
+  60% {
+    transform: translate3d(2.5px, 1.5px, 0) rotate(0.25deg);
+  }
+  75% {
+    transform: translate3d(-1px, 0.5px, 0) rotate(0deg);
+  }
+}
+
+.screen-shake {
+  animation: brutal-screen-shake 0.42s cubic-bezier(0.36, 0.07, 0.19, 0.97) both;
+}
+
+@keyframes button-punch {
+  0% {
+    transform: scale(0.93) translateY(2px);
+  }
+  45% {
+    transform: scale(1.05) translateY(-2px);
+  }
+  75% {
+    transform: scale(0.98) translateY(0);
+  }
+  100% {
+    transform: scale(1) translateY(0);
+  }
+}
+
+.button-punch {
+  animation: button-punch 0.38s cubic-bezier(0.2, 0.8, 0.2, 1);
+}
+
+
+

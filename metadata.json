@@ -1,0 +1,6 @@
+{
+  "name": "datings.lol",
+  "description": "Brutalist dating coach & chat roaster web app with daily lessons, instant AI roasts, profile audits, and streak tracking.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
