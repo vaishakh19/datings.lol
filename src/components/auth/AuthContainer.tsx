@@ -1,30 +1,28 @@
 import React, { useState } from "react";
-import { Lock, UserPlus, KeyRound, User, Sun, Moon, Sparkles, ShieldCheck, Flame } from "lucide-react";
+import { Lock, UserPlus, KeyRound, User, ShieldCheck } from "lucide-react";
 import { AuthUser, AuthView } from "../../types";
 import { SignInForm } from "./SignInForm";
 import { SignUpForm } from "./SignUpForm";
-import { ForgotPasswordForm } from "./ForgotPasswordForm";
-import { ForgotUsernameForm } from "./ForgotUsernameForm";
 
 interface AuthContainerProps {
   onAuthSuccess: (user: AuthUser) => void;
   onContinueAsGuest?: () => void;
   initialView?: AuthView;
-  theme?: "light" | "dark";
-  onToggleTheme?: () => void;
 }
 
 export const AuthContainer: React.FC<AuthContainerProps> = ({
   onAuthSuccess,
   onContinueAsGuest,
   initialView = "signin",
-  theme = "light",
-  onToggleTheme,
 }) => {
   const [currentView, setCurrentView] = useState<AuthView>(initialView);
   const [targetIdentifier, setTargetIdentifier] = useState<string>("");
 
   const handleNavigate = (view: AuthView, identifier?: string) => {
+    if (view === "forgot_password") {
+      window.location.assign(`/forgot-password${identifier ? `?email=${encodeURIComponent(identifier)}` : ""}`);
+      return;
+    }
     setCurrentView(view);
     if (identifier !== undefined) {
       setTargetIdentifier(identifier);
@@ -35,7 +33,6 @@ export const AuthContainer: React.FC<AuthContainerProps> = ({
     { id: "signin", label: "Sign In", icon: <Lock size={14} /> },
     { id: "signup", label: "Sign Up", icon: <UserPlus size={14} /> },
     { id: "forgot_password", label: "Forgot Password", icon: <KeyRound size={14} /> },
-    { id: "forgot_username", label: "Forgot Username", icon: <User size={14} /> },
   ];
 
   return (
@@ -62,21 +59,6 @@ export const AuthContainer: React.FC<AuthContainerProps> = ({
         </div>
 
         <div className="flex items-center gap-2">
-          {onToggleTheme && (
-            <button
-              onClick={onToggleTheme}
-              className="w-10 h-10 bg-white dark:bg-[#1A1A1A] border-[2.5px] border-black rounded-full flex items-center justify-center brutal-shadow-sm active:translate-y-[1px] active:shadow-none transition-transform cursor-pointer"
-              title={`Switch to ${theme === "dark" ? "Light" : "Dark"} mode`}
-              aria-label="Toggle theme"
-            >
-              {theme === "dark" ? (
-                <Sun size={18} className="text-[#FFE066] fill-[#FFE066]" />
-              ) : (
-                <Moon size={18} className="text-black" />
-              )}
-            </button>
-          )}
-
           {onContinueAsGuest && (
             <button
               onClick={onContinueAsGuest}
@@ -135,19 +117,7 @@ export const AuthContainer: React.FC<AuthContainerProps> = ({
             />
           )}
 
-          {currentView === "forgot_password" && (
-            <ForgotPasswordForm
-              onNavigate={handleNavigate}
-              initialIdentifier={targetIdentifier}
-            />
-          )}
-
-          {currentView === "forgot_username" && (
-            <ForgotUsernameForm
-              onNavigate={handleNavigate}
-              initialEmail={targetIdentifier}
-            />
-          )}
+          {currentView === "forgot_password" && <p className="font-bold">Redirecting to password recovery...</p>}
         </div>
 
         {/* Guest continue option for easy testing */}

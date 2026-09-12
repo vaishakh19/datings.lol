@@ -1,17 +1,17 @@
-import React, { useState, useEffect } from "react";
+import React, { useMemo, useState } from "react";
 import {
-  Calendar,
+  ArrowRight,
+  Brain,
   Check,
-  Eye,
-  Target,
-  Sparkles,
-  Lock,
-  Clock,
-  X,
+  ChevronRight,
   Flame,
-  ArrowDown,
-  BellRing,
-  Pencil,
+  MessageCircle,
+  Play,
+  Send,
+  Sparkles,
+  Target,
+  Trophy,
+  Zap,
 } from "lucide-react";
 import { Lesson, UserProgress } from "../types";
 import { getRankInfo } from "../data/lessons";
@@ -23,583 +23,229 @@ interface TodayTabProps {
   progress: UserProgress;
   isDayCompleted: boolean;
   onCompleteDay: (reflectionText: string, isReadChecked: boolean) => void;
-  triggerConfetti: () => void;
-  onUpdateDailyFocus?: (focus: string) => void;
-  onOpenHotTake?: () => void;
-  todayHotTakeTopic?: string;
-  adminFocus?: string;
+  onQuickFix: (problem: string) => void;
+  onPracticeComplete?: (scenario: string, score: number) => void;
+  onRealWorldComplete?: () => void;
   adminNote?: string;
+}
+
+const QUICK_FIXES = [
+  { label: "Dry conversation", prompt: "Conversation feels dry", color: "#FFE066" },
+  { label: "Left on read", prompt: "They left me on read", color: "#FDA4AF" },
+  { label: "Don't know what to say", prompt: "I don't know what to say", color: "#A78BFA" },
+  { label: "Came on too strong", prompt: "I came on too strong", color: "#BEF264" },
+  { label: "Want to ask them out", prompt: "I want to ask them out", color: "#FFE066" },
+  { label: "Overthinking", prompt: "I am overthinking this", color: "#FDA4AF" },
+];
+
+const SCENARIOS = [
+  "New match",
+  "Someone I already know",
+  "Crush",
+  "First date",
+  "Asking someone out",
+  "Reconnecting",
+  "Flirty conversation",
+];
+
+function getTodayKey(): string {
+  return new Date().toLocaleDateString("en-CA");
 }
 
 export const TodayTab: React.FC<TodayTabProps> = ({
   currentDay,
   lesson,
-  nextLesson,
   progress,
   isDayCompleted,
   onCompleteDay,
-  onUpdateDailyFocus,
-  onOpenHotTake,
-  todayHotTakeTopic,
-  adminFocus,
+  onQuickFix,
+  onPracticeComplete,
+  onRealWorldComplete,
   adminNote,
 }) => {
-  const [reflection, setReflection] = useState("");
-  const [readChecked, setReadChecked] = useState(false);
-  const [isShaking, setIsShaking] = useState(false);
-
-  // Daily focus state
-  const [isEditingFocus, setIsEditingFocus] = useState(false);
-  const activeDailyFocus = adminFocus || progress.dailyFocus || "";
-  const [focusInput, setFocusInput] = useState(activeDailyFocus);
-
-  useEffect(() => {
-    if (activeDailyFocus !== undefined) {
-      setFocusInput(activeDailyFocus);
-    }
-  }, [activeDailyFocus]);
-
-  const handleSaveFocus = (e?: React.FormEvent) => {
-    if (e) e.preventDefault();
-    const trimmed = focusInput.trim();
-    if (onUpdateDailyFocus) {
-      onUpdateDailyFocus(trimmed);
-    }
-    setIsEditingFocus(false);
-  };
-
-  const handleQuickFocusSelect = (preset: string) => {
-    setFocusInput(preset);
-    if (onUpdateDailyFocus) {
-      onUpdateDailyFocus(preset);
-    }
-    setIsEditingFocus(false);
-  };
-
-  // Daily reminder state tracked via localStorage
-  const [lastNotificationTimestamp, setLastNotificationTimestamp] = useState<number | null>(() => {
-    const saved = localStorage.getItem("datings_reminder_last_timestamp");
-    return saved ? parseInt(saved, 10) : null;
-  });
-
-  const [isDismissedToday, setIsDismissedToday] = useState<boolean>(() => {
-    const todayStr = new Date().toLocaleDateString("en-CA");
-    const dismissedDate = localStorage.getItem("datings_reminder_dismissed_date");
-    return dismissedDate === todayStr;
-  });
-
-  const [simulatePast6PM, setSimulatePast6PM] = useState<boolean>(false);
-
-  const currentHour = new Date().getHours();
-  const isPast6PM = currentHour >= 18 || simulatePast6PM;
-  const shouldShowReminder = !isDayCompleted && isPast6PM && !isDismissedToday;
-
-  // Whenever the reminder is active, update the last notification timestamp in localStorage if not already recorded today
-  useEffect(() => {
-    if (shouldShowReminder) {
-      const now = Date.now();
-      localStorage.setItem("datings_reminder_last_timestamp", now.toString());
-      setLastNotificationTimestamp(now);
-    }
-  }, [shouldShowReminder]);
-
-  const handleDismissReminder = () => {
-    const todayStr = new Date().toLocaleDateString("en-CA");
-    const now = Date.now();
-    localStorage.setItem("datings_reminder_dismissed_date", todayStr);
-    localStorage.setItem("datings_reminder_last_timestamp", now.toString());
-    setIsDismissedToday(true);
-    setLastNotificationTimestamp(now);
-  };
-
-  const handleResetReminderForTest = () => {
-    localStorage.removeItem("datings_reminder_dismissed_date");
-    setIsDismissedToday(false);
-    setSimulatePast6PM(true);
-  };
-
-  const scrollToTask = () => {
-    const el = document.getElementById("today-task-card");
-    if (el) {
-      el.scrollIntoView({ behavior: "smooth" });
-    }
-  };
-
   const rank = getRankInfo(progress.xp);
+  const [missionStarted, setMissionStarted] = useState(false);
+  const [reflection, setReflection] = useState("");
+  const [showPractice, setShowPractice] = useState(false);
+  const [scenario, setScenario] = useState(SCENARIOS[0]);
+  const [practiceMessages, setPracticeMessages] = useState<string[]>([]);
+  const [practiceInput, setPracticeInput] = useState("");
+  const [practiceLoading, setPracticeLoading] = useState(false);
+  const [practiceFinished, setPracticeFinished] = useState(false);
+  const [practiceScore, setPracticeScore] = useState(0);
+  const [realWorldDone, setRealWorldDone] = useState(false);
 
-  const handleComplete = () => {
-    if (isDayCompleted) return;
+  const xpIntoLevel = progress.xp % 200;
+  const xpTarget = 200;
+  const progressPercent = Math.min(100, Math.round((xpIntoLevel / xpTarget) * 100));
+  const todayEntries = useMemo(
+    () => progress.journal.filter((entry) => entry.date.slice(0, 10) === getTodayKey()),
+    [progress.journal]
+  );
+  const actionsComplete = todayEntries.length + (realWorldDone ? 1 : 0);
+  const missionTitle = lesson.task.title;
+  const missionDescription = lesson.task.desc;
+  const difficulty = lesson.task.difficulty === "spicy" ? "advanced" : lesson.task.difficulty;
 
-    // 1. Tactile vibration pattern if supported on device (pulse - pause - heavy punch)
-    if (typeof window !== "undefined" && "vibrate" in navigator) {
-      try {
-        navigator.vibrate([45, 30, 85]);
-      } catch {}
+  const startPractice = () => {
+    setShowPractice(true);
+    setPracticeFinished(false);
+    setPracticeScore(0);
+    setPracticeMessages([
+      `Scenario: ${scenario}`,
+      "okay, you matched. what do you say first?",
+    ]);
+  };
+
+  const sendPracticeMessage = async () => {
+    const clean = practiceInput.trim();
+    if (!clean || practiceLoading || practiceFinished) return;
+    setPracticeInput("");
+    const nextMessages = [...practiceMessages, `you: ${clean}`];
+    setPracticeMessages(nextMessages);
+    setPracticeLoading(true);
+    try {
+      const response = await fetch("/api/coach", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          message: `Dating simulation. Scenario: ${scenario}. Reply naturally as the other person. Do not coach or reveal the answer. User message: ${clean}`,
+          vibe: "direct",
+          history: nextMessages.map((text, index) => ({
+            role: index % 2 === 0 ? "coach" : "user",
+            text,
+          })),
+        }),
+      });
+      const data = await response.json();
+      setPracticeMessages((current) => [...current, data.text || "interesting... tell me more"]);
+    } catch {
+      setPracticeMessages((current) => [...current, "hmm okay, now make that more specific and playful."]);
+    } finally {
+      setPracticeLoading(false);
     }
+  };
 
-    // 2. Trigger brutalist screen-shake animation
-    setIsShaking(true);
-    setTimeout(() => {
-      setIsShaking(false);
-    }, 450);
+  const finishPractice = () => {
+    const score = Math.min(100, 48 + Math.min(42, Math.max(0, practiceMessages.length - 2) * 8));
+    setPracticeScore(score);
+    setPracticeFinished(true);
+    onPracticeComplete?.(scenario, score);
+  };
 
-    // 3. Complete day and claim XP
-    onCompleteDay(reflection, readChecked);
+  const completeMission = () => {
+    if (isDayCompleted) return;
+    onCompleteDay(reflection || `Completed: ${missionTitle}`, true);
+  };
+
+  const completeRealWorld = () => {
+    if (realWorldDone) return;
+    setRealWorldDone(true);
+    onRealWorldComplete?.();
   };
 
   return (
-    <div className={`space-y-5 transition-transform ${isShaking ? "screen-shake" : ""}`}>
-      {/* 6 PM Daily Streak Reminder Banner */}
-      {shouldShowReminder && (
-        <div className="bg-[#FEF08A] border-[3px] border-black rounded-[20px] p-4 brutal-shadow-sm transition-all animate-[pop_0.3s_ease-out]">
-          <div className="flex items-start justify-between gap-3">
-            <div className="flex items-start gap-3">
-              <div className="w-10 h-10 rounded-[12px] bg-black text-white flex items-center justify-center shrink-0 mt-0.5 border-[2px] border-black brutal-shadow-sm">
-                <BellRing size={20} className="text-[#FFE066] animate-bounce" />
-              </div>
-              <div className="space-y-1">
-                <div className="flex items-center gap-2 flex-wrap">
-                  <span className="bg-black text-[#FFE066] text-[10px] font-black uppercase tracking-wider px-2 py-0.5 rounded-full">
-                    ⏰ 6:00 PM Streak Alert
-                  </span>
-                  {simulatePast6PM && currentHour < 18 && (
-                    <span className="bg-white border border-black text-[9px] font-black uppercase px-1.5 py-0.5 rounded-full text-black/60">
-                      Simulated 6 PM
-                    </span>
-                  )}
-                </div>
-                <h4 className="font-black text-[15px] leading-tight text-[#111]">
-                  Don't lose your {progress.streak > 0 ? `${progress.streak}-day ` : ""}streak tonight!
-                </h4>
-                <p className="text-[12px] font-medium text-[#111]/80 leading-snug">
-                  It's past 6 PM and today's lesson isn't finished yet. Take 2 minutes to claim your +{lesson.task.xp} XP before midnight.
-                </p>
-                {lastNotificationTimestamp && (
-                  <div className="text-[10px] font-bold text-[#111]/60 pt-0.5 flex items-center gap-1">
-                    <Clock size={11} />
-                    Last alert logged: {new Date(lastNotificationTimestamp).toLocaleTimeString([], { hour: "numeric", minute: "2-digit" })}
-                  </div>
-                )}
-              </div>
-            </div>
-
-            <button
-              onClick={handleDismissReminder}
-              title="Dismiss reminder for today"
-              className="w-7 h-7 rounded-full border-[2px] border-black bg-white flex items-center justify-center shrink-0 hover:bg-black hover:text-white transition-colors"
-            >
-              <X size={14} strokeWidth={3} />
-            </button>
-          </div>
-
-          <div className="mt-3 pt-3 border-t-[1.5px] border-black/20 flex items-center justify-between gap-2">
-            <button
-              onClick={scrollToTask}
-              className="bg-[#111] text-white text-[11px] font-black uppercase tracking-wide px-3.5 py-1.5 rounded-full border-[2px] border-black flex items-center gap-1.5 hover:bg-black active:scale-95 transition-transform"
-            >
-              Finish Today's Task <ArrowDown size={13} />
-            </button>
-            <button
-              onClick={handleDismissReminder}
-              className="text-[11px] font-black uppercase text-[#111]/70 hover:text-black underline underline-offset-2"
-            >
-              Dismiss Today
-            </button>
-          </div>
-        </div>
-      )}
-
-      {/* Date Header Banner */}
-      <div className="flex justify-between items-start">
+    <div className="space-y-5">
+      <section className="flex items-end justify-between gap-4">
         <div>
-          <div className="inline-flex items-center gap-2 bg-black text-white px-3 py-1 rounded-full text-[11px] font-black uppercase tracking-widest mb-2">
-            <Calendar size={12} /> Day {currentDay} •{" "}
-            {new Date().toLocaleDateString("en-US", {
-              month: "short",
-              day: "numeric",
-            })}
+          <div className="inline-flex items-center gap-2 bg-black text-white px-3 py-1 rounded-full text-[10px] font-black uppercase tracking-widest mb-3">
+            <Target size={12} /> Day {currentDay} • Today
           </div>
-          <h1 className="text-[32px] font-black leading-[0.9] tracking-tighter">
-            today's glow-up
-          </h1>
-          <div className="flex items-center gap-2 mt-1">
-            <p className="text-[14px] font-medium opacity-60">
-              one lesson. one task. no bs.
-            </p>
-            {/* Quick reminder test toggle if before 6 PM and not completed */}
-            {!isDayCompleted && (
-              <button
-                onClick={() => {
-                  if (shouldShowReminder) {
-                    handleDismissReminder();
-                  } else {
-                    handleResetReminderForTest();
-                  }
-                }}
-                className="text-[10px] font-black uppercase tracking-wider px-2 py-0.5 rounded-full border border-black/30 bg-white/70 hover:bg-white text-black/70 flex items-center gap-1"
-                title="Test or toggle the 6 PM daily reminder banner"
-              >
-                <Clock size={10} />
-                {shouldShowReminder ? "Hide 6PM alert" : "Test 6PM alert"}
-              </button>
-            )}
-          </div>
+          <h1 className="text-[34px] sm:text-[40px] font-black leading-[0.88] tracking-tighter">today&apos;s glow-up</h1>
+          <p className="text-[14px] font-bold opacity-60 mt-2">one useful move. that&apos;s it.</p>
         </div>
-
-        <div className="bg-white border-[3px] border-black rounded-[16px] px-3 py-2 text-center brutal-shadow-sm">
-          <div className="text-[10px] font-black uppercase opacity-50">
-            Level
-          </div>
-          <div className="font-black text-[14px] leading-none flex items-center gap-1">
-            {rank.emoji} {rank.name}
-          </div>
+        <div className="text-right shrink-0">
+          <div className="text-[10px] font-black uppercase opacity-50">Level {Math.floor(progress.xp / 200) + 1}</div>
+          <div className="font-black text-[15px] flex items-center gap-1 justify-end">{rank.emoji} {rank.name}</div>
         </div>
-      </div>
+      </section>
 
-      {/* Daily Focus Section */}
+      <section className="bg-white border-[3px] border-black rounded-[20px] p-4 brutal-shadow-sm">
+        <div className="flex items-center justify-between text-[11px] font-black uppercase">
+          <span>Progress to next level</span>
+          <span>{xpIntoLevel} / {xpTarget} XP</span>
+        </div>
+        <div className="h-3 bg-[#FFFBEB] border-[2px] border-black rounded-full mt-2 overflow-hidden">
+          <div className="h-full bg-[#FFE066] transition-all" style={{ width: `${progressPercent}%` }} />
+        </div>
+      </section>
+
       {adminNote && (
-        <div className="bg-[#BEF264] border-[3px] border-black rounded-[20px] p-4 brutal-shadow-sm">
-          <div className="flex items-start gap-3">
-            <div className="w-9 h-9 rounded-full bg-black text-[#BEF264] flex items-center justify-center shrink-0 border-[2px] border-black font-black text-[13px]">
-              !
-            </div>
-            <div>
-              <span className="text-[10px] font-black uppercase tracking-widest text-black/70">
-                Admin Note
-              </span>
-              <p className="font-black text-[14px] leading-snug text-[#111] mt-0.5">
-                {adminNote}
-              </p>
-            </div>
-          </div>
+        <div className="bg-[#BEF264] border-[3px] border-black rounded-[18px] p-3.5 font-bold text-[13px] flex gap-2">
+          <Sparkles size={18} className="shrink-0" /> {adminNote}
         </div>
       )}
 
-      {activeDailyFocus && !isEditingFocus ? (
-        <div className="bg-[#FFE066] border-[3px] border-black rounded-[20px] p-4 brutal-shadow-sm transition-all">
-          <div className="flex items-start justify-between gap-3">
-            <div className="flex items-start gap-3">
-              <div className="w-9 h-9 rounded-full bg-black text-[#FFE066] flex items-center justify-center shrink-0 mt-0.5 border-[2px] border-black font-black text-[14px]">
-                🎯
-              </div>
-              <div>
-                <div className="flex items-center gap-2">
-                  <span className="text-[10px] font-black uppercase tracking-widest text-black/70">
-                    Today's Dating Focus
-                  </span>
-                  <span className="w-2 h-2 rounded-full bg-black animate-pulse" />
-                </div>
-                <p className="font-black text-[16px] leading-snug text-[#111] mt-0.5">
-                  "{activeDailyFocus}"
-                </p>
-              </div>
+      <section className="bg-[#FFE066] border-[3px] border-black rounded-[24px] p-5 brutal-shadow">
+        <div className="flex items-start justify-between gap-3 mb-4">
+          <div>
+            <div className="flex items-center gap-2 text-[11px] font-black uppercase tracking-widest">
+              <Flame size={16} /> Today&apos;s mission
             </div>
-
-            <button
-              onClick={() => {
-                setFocusInput(activeDailyFocus);
-                setIsEditingFocus(true);
-              }}
-              className="text-[11px] font-black uppercase px-2.5 py-1 rounded-full border-[2px] border-black bg-white hover:bg-black hover:text-white transition-colors flex items-center gap-1 shrink-0 brutal-shadow-sm"
-              title="Edit Daily Focus"
-            >
-              <Pencil size={11} /> Edit
-            </button>
+            <h2 className="text-[27px] sm:text-[31px] font-black tracking-tighter leading-[0.92] mt-2">{missionTitle}</h2>
           </div>
+          <div className="bg-black text-[#FFE066] border-[2px] border-black rounded-full px-2.5 py-1 text-[11px] font-black shrink-0">+{lesson.task.xp} XP</div>
         </div>
-      ) : (
-        <div className="bg-white border-[3px] border-black rounded-[20px] p-4 brutal-shadow-sm space-y-3">
-          <div className="flex items-center justify-between">
-            <div className="flex items-center gap-2">
-              <div className="w-7 h-7 rounded-full bg-[#FFE066] text-black border-[2px] border-black flex items-center justify-center font-black text-[12px]">
-                🎯
-              </div>
-              <span className="font-black text-[13px] uppercase tracking-wide">
-                Set Your Daily Dating Focus
-              </span>
-            </div>
-            {activeDailyFocus && (
-              <button
-                type="button"
-                onClick={() => setIsEditingFocus(false)}
-                className="text-[11px] font-bold text-black/60 hover:text-black uppercase"
-              >
-                Cancel
-              </button>
-            )}
-          </div>
-
-          <form onSubmit={handleSaveFocus} className="flex gap-2">
-            <input
-              type="text"
-              value={focusInput}
-              onChange={(e) => setFocusInput(e.target.value)}
-              placeholder="e.g. Ask for the date, stop double texting, be playful..."
-              className="flex-1 px-3.5 py-2 text-[13px] font-medium bg-[#FFFBEB] border-[2px] border-black rounded-full focus:outline-none focus:ring-2 focus:ring-black placeholder:text-black/40"
-              maxLength={70}
-            />
-            <button
-              type="submit"
-              disabled={!focusInput.trim()}
-              className={`px-4 py-2 font-black text-[12px] uppercase rounded-full border-[2px] border-black transition-all ${
-                focusInput.trim()
-                  ? "bg-[#FFE066] text-black hover:translate-y-[-1px] brutal-shadow-sm active:translate-y-0"
-                  : "bg-gray-200 text-gray-400 cursor-not-allowed"
-              }`}
-            >
-              Save
-            </button>
-          </form>
-
-          {/* Quick preset chips */}
-          <div className="flex items-center gap-1.5 flex-wrap pt-0.5">
-            <span className="text-[10px] font-black uppercase opacity-50 mr-1">
-              Quick pick:
-            </span>
-            {[
-              "Be playful & tease",
-              "Ask for a date",
-              "Stop dry texting",
-              "No overthinking",
-            ].map((preset) => (
-              <button
-                key={preset}
-                type="button"
-                onClick={() => handleQuickFocusSelect(preset)}
-                className="text-[10px] font-black px-2.5 py-1 rounded-full border-[1.5px] border-black bg-[#FFFBEB] hover:bg-[#FFE066] active:scale-95 transition-all text-black"
-              >
-                +{preset}
-              </button>
-            ))}
-          </div>
+        <p className="text-[14px] font-bold leading-relaxed max-w-[520px]">{missionDescription}</p>
+        <div className="bg-white/70 border-[2px] border-black rounded-[16px] p-3 mt-4">
+          <div className="text-[10px] font-black uppercase tracking-widest mb-1">Your move</div>
+          <p className="text-[13px] font-bold">Use one specific detail, share something about yourself, and leave them an easy way to respond.</p>
         </div>
-      )}
-
-      {/* Daily Hot Take Teaser Banner */}
-      {onOpenHotTake && (
-        <div
-          onClick={onOpenHotTake}
-          className="bg-white dark:bg-[#181818] border-[3px] border-black rounded-[20px] p-3.5 brutal-shadow-sm flex items-center justify-between cursor-pointer hover:bg-[#FFFBEB] active:scale-[0.99] transition-all group"
+        {missionStarted && !isDayCompleted && (
+          <textarea
+            value={reflection}
+            onChange={(event) => setReflection(event.target.value)}
+            placeholder="What happened? Drop a quick reflection..."
+            className="w-full min-h-[76px] mt-3 bg-[#FFFBEB] border-[2px] border-black rounded-[14px] p-3 text-[13px] font-medium outline-none resize-none"
+          />
+        )}
+        <button
+          type="button"
+          onClick={() => (missionStarted ? completeMission() : setMissionStarted(true))}
+          disabled={isDayCompleted}
+          className={`w-full mt-4 h-[50px] rounded-full border-[3px] border-black font-black uppercase text-[13px] flex items-center justify-center gap-2 ${isDayCompleted ? "bg-[#BEF264]" : "bg-black text-white hover:translate-y-[-1px]"}`}
         >
-          <div className="flex items-center gap-3">
-            <div className="w-8 h-8 rounded-full bg-[#FFE066] text-black border-[2px] border-black flex items-center justify-center font-black shrink-0 text-[14px]">
-              🔥
-            </div>
-            <div>
-              <div className="flex items-center gap-2">
-                <span className="text-[10px] font-black uppercase tracking-wider bg-black text-[#FFE066] px-1.5 py-0.2 rounded-full">
-                  Daily Hot Take
-                </span>
-                <span className="text-[10px] font-black text-black dark:text-[#BEF264] bg-[#BEF264]/40 px-1.5 py-0.2 rounded-full border border-black/30">
-                  +25 XP
-                </span>
-              </div>
-              <p className="text-[12px] font-black leading-tight text-[#111] dark:text-white mt-0.5 group-hover:text-black">
-                {todayHotTakeTopic ? `Topic: ${todayHotTakeTopic}` : "Vote on today's spicy dating debate"}
-              </p>
-            </div>
-          </div>
-          <span className="text-[11px] font-black uppercase px-3 py-1 rounded-full border-[2px] border-black bg-[#BEF264] text-black shrink-0 group-hover:bg-[#a3e635]">
-            Vote
-          </span>
+          {isDayCompleted ? <><Check size={18} /> Mission complete</> : missionStarted ? <>Complete mission <Trophy size={17} /></> : <>Start mission <ArrowRight size={17} /></>}
+        </button>
+      </section>
+
+      <section className="bg-white border-[3px] border-black rounded-[22px] p-4 brutal-shadow-sm">
+        <div className="flex items-center gap-2 mb-3"><Zap size={18} className="fill-[#FFE066]" /><h2 className="font-black text-[16px] uppercase tracking-tight">Something feeling off?</h2></div>
+        <p className="text-[12px] font-bold opacity-60 mb-3">Pick the problem. Coach opens with context already loaded.</p>
+        <div className="grid grid-cols-2 sm:grid-cols-3 gap-2">
+          {QUICK_FIXES.map((fix) => (
+            <button key={fix.prompt} type="button" onClick={() => onQuickFix(fix.prompt)} className="text-left min-h-[54px] px-2.5 py-2 border-[2px] border-black rounded-[12px] font-black text-[11px] leading-tight hover:translate-y-[-1px]" style={{ background: fix.color }}>
+              {fix.label}<ChevronRight size={14} className="inline ml-1" />
+            </button>
+          ))}
         </div>
-      )}
+      </section>
 
-      {/* Lesson Card */}
-      <div className="bg-white border-[3px] border-black rounded-[24px] overflow-hidden brutal-shadow">
-        <div className="h-[8px] w-full" style={{ background: lesson.color }} />
-        <div className="p-5">
-          <div className="flex items-start justify-between gap-3 mb-4">
-            <div className="flex-1">
-              <div className="flex items-center gap-2 mb-2">
-                <div className="px-2.5 py-1 bg-[#111] text-white rounded-full text-[10px] font-black uppercase tracking-widest">
-                  Lesson • {lesson.id}
-                </div>
-                <div
-                  className="px-2.5 py-1 border-[2px] border-black rounded-full text-[10px] font-black uppercase"
-                  style={{ background: lesson.color }}
-                >
-                  {lesson.tags[0]}
-                </div>
-              </div>
-              <h2 className="text-[22px] font-black leading-[0.95] tracking-tighter">
-                {lesson.title}
-              </h2>
-              <p className="text-[13px] font-bold opacity-60 mt-1">
-                {lesson.subtitle}
-              </p>
-            </div>
-            <div
-              className="w-12 h-12 rounded-full border-[3px] border-black flex items-center justify-center text-[20px] shrink-0"
-              style={{ background: lesson.color }}
-            >
-              📖
-            </div>
-          </div>
-
-          <div className="space-y-3 text-[14px] leading-[1.5] font-medium">
-            {lesson.paragraphs.map((p, idx) => (
-              <p key={idx} className={idx === 0 ? "font-bold text-[15px]" : ""}>
-                {p}
-              </p>
-            ))}
-          </div>
-
-          {/* Good Move vs Trash Move Examples */}
-          <div className="grid grid-cols-1 sm:grid-cols-2 gap-3 mt-5">
-            <div className="bg-[#FFFBEB] border-[2.5px] border-black rounded-[16px] p-3">
-              <div className="flex items-center gap-1.5 mb-1.5">
-                <div className="w-5 h-5 bg-[#BEF264] border-[2px] border-black rounded-full flex items-center justify-center">
-                  <Check size={12} strokeWidth={4} />
-                </div>
-                <span className="font-black text-[11px] uppercase tracking-wide">
-                  Good move
-                </span>
-              </div>
-              <p className="text-[13px] font-medium italic">
-                "{lesson.goodExample}"
-              </p>
-            </div>
-
-            <div className="bg-black text-white border-[2.5px] border-black rounded-[16px] p-3">
-              <div className="flex items-center gap-1.5 mb-1.5">
-                <div className="w-5 h-5 bg-[#FDA4AF] border-[2px] border-white rounded-full flex items-center justify-center">
-                  <span className="text-black font-black text-[10px]">✕</span>
-                </div>
-                <span className="font-black text-[11px] uppercase tracking-wide">
-                  Trash move
-                </span>
-              </div>
-              <p className="text-[13px] font-medium italic opacity-90">
-                "{lesson.badExample}"
-              </p>
-            </div>
-          </div>
-
-          {/* Read Toggle Button */}
-          <button
-            onClick={() => {
-              if (!readChecked) {
-                if (typeof window !== "undefined" && "vibrate" in navigator) {
-                  try { navigator.vibrate(30); } catch {}
-                }
-              }
-              setReadChecked(!readChecked);
-            }}
-            disabled={readChecked}
-            className={`mt-5 w-full h-[48px] rounded-full border-[3px] border-black font-black text-[14px] uppercase tracking-wide flex items-center justify-center gap-2 transition-all active:scale-98 ${
-              readChecked
-                ? "bg-[#BEF264] text-black"
-                : "bg-[#111] text-white hover:translate-y-[-1px] hover:shadow-[0px_4px_0px_0px_#111] active:translate-y-0 active:shadow-none"
-            }`}
-          >
-            {readChecked ? (
-              <>
-                <Check size={18} strokeWidth={3} /> Read • +10 XP
-              </>
-            ) : (
-              <>
-                <Eye size={18} /> Mark as read • +10 XP
-              </>
-            )}
-          </button>
+      <section className="bg-[#A78BFA] border-[3px] border-black rounded-[22px] p-4 brutal-shadow-sm">
+        <div className="flex items-start justify-between gap-3">
+          <div><div className="flex items-center gap-2 text-[11px] font-black uppercase tracking-widest"><Brain size={16} /> Practice</div><h2 className="font-black text-[22px] tracking-tight mt-1">2-minute AI conversation</h2><p className="text-[12px] font-bold mt-1">Build reps without risking the real chat.</p></div>
+          <button type="button" onClick={() => setShowPractice(true)} className="bg-white border-[2px] border-black rounded-full px-3 py-2 font-black text-[11px] uppercase shrink-0"><Play size={13} className="inline mr-1" /> Practice now</button>
         </div>
-      </div>
-
-      {/* Today's Task Card */}
-      <div id="today-task-card" className="bg-[#111] text-white border-[3px] border-black rounded-[24px] overflow-hidden brutal-shadow">
-        <div className="p-5">
-          <div className="flex items-center justify-between mb-4">
-            <div className="flex items-center gap-2">
-              <div className="w-9 h-9 bg-[#FFE066] text-black border-[2.5px] border-white rounded-full flex items-center justify-center">
-                <Target size={18} strokeWidth={3} />
-              </div>
-              <div>
-                <div className="font-black text-[13px] uppercase tracking-widest opacity-60">
-                  Today's Task
-                </div>
-                <div className="font-black text-[18px] leading-none tracking-tight">
-                  {lesson.task.title}
-                </div>
-              </div>
-            </div>
-            <div
-              className={`px-3 py-1 rounded-full border-[2px] border-white text-[10px] font-black uppercase tracking-widest ${
-                lesson.task.difficulty === "easy"
-                  ? "bg-[#BEF264] text-black"
-                  : lesson.task.difficulty === "medium"
-                  ? "bg-[#FFE066] text-black"
-                  : "bg-[#FDA4AF] text-black"
-              }`}
-            >
-              {lesson.task.difficulty} • +{lesson.task.xp} XP
-            </div>
+        {showPractice && (
+          <div className="bg-white border-[2px] border-black rounded-[16px] p-3 mt-4">
+            <div className="flex flex-wrap gap-1.5 mb-3">{SCENARIOS.map((item) => <button key={item} type="button" onClick={() => { setScenario(item); setPracticeMessages([]); setPracticeFinished(false); }} className={`px-2.5 py-1 rounded-full border-[1.5px] border-black text-[10px] font-black ${scenario === item ? "bg-[#FFE066]" : "bg-[#FFFBEB]"}`}>{item}</button>)}</div>
+            {practiceMessages.length === 0 ? <button type="button" onClick={startPractice} className="w-full h-10 bg-black text-white rounded-full font-black text-[12px] uppercase">Start {scenario}</button> : <>
+              <div className="space-y-2 max-h-[180px] overflow-y-auto mb-3">{practiceMessages.map((message, index) => <div key={`${message}-${index}`} className={`text-[12px] font-bold p-2.5 rounded-[12px] border-[2px] border-black ${index % 2 ? "bg-[#FFFBEB] ml-6" : "bg-[#BEF264] mr-6"}`}>{message}</div>)}</div>
+              {!practiceFinished ? <div className="flex gap-2"><input value={practiceInput} onChange={(event) => setPracticeInput(event.target.value)} onKeyDown={(event) => { if (event.key === "Enter") void sendPracticeMessage(); }} placeholder={practiceLoading ? "Coach is thinking..." : "Type your message..."} className="flex-1 min-w-0 h-10 bg-[#FFFBEB] border-[2px] border-black rounded-full px-3 text-[12px] font-bold outline-none" /><button type="button" onClick={() => void sendPracticeMessage()} className="w-10 h-10 bg-black text-white rounded-full flex items-center justify-center"><Send size={15} /></button><button type="button" onClick={finishPractice} className="px-3 h-10 bg-[#FFE066] border-[2px] border-black rounded-full font-black text-[10px]">FINISH</button></div> : <div className="bg-[#BEF264] border-[2px] border-black rounded-[12px] p-3 font-black text-[13px]">Score: {practiceScore}/100. Keep the energy specific, curious, and low-pressure.</div>}
+            </>}
           </div>
+        )}
+      </section>
 
-          <p className="text-[14px] font-medium opacity-80 leading-[1.4] mb-4">
-            {lesson.task.desc}
-          </p>
+      <section className="bg-[#FDA4AF] border-[3px] border-black rounded-[20px] p-4 flex items-center justify-between gap-3">
+        <div><div className="text-[10px] font-black uppercase tracking-widest flex items-center gap-1"><MessageCircle size={13} /> Real-world move</div><p className="font-black text-[15px] leading-tight mt-1">Ask one open question, then share something about yourself.</p></div>
+        <button type="button" onClick={completeRealWorld} disabled={realWorldDone} className={`shrink-0 px-3 py-2 border-[2px] border-black rounded-full font-black text-[10px] uppercase ${realWorldDone ? "bg-[#BEF264]" : "bg-white"}`}>{realWorldDone ? "Done" : "I did it"}</button>
+      </section>
 
-          <div className="bg-white rounded-[16px] border-[3px] border-white p-1">
-            <textarea
-              value={reflection}
-              onChange={(e) => setReflection(e.target.value)}
-              placeholder="How did it go? What did you learn? Be real..."
-              className="w-full min-h-[90px] bg-[#FFFBEB] rounded-[12px] border-[2px] border-black p-3 text-[14px] font-medium text-black placeholder:opacity-40 outline-none resize-none"
-            />
-          </div>
-
-          <button
-            onClick={handleComplete}
-            disabled={isDayCompleted}
-            className={`mt-4 w-full h-[52px] rounded-full font-black text-[15px] uppercase tracking-wide flex items-center justify-center gap-2 border-[3px] transition-all ${
-              isShaking ? "button-punch" : ""
-            } ${
-              isDayCompleted
-                ? "bg-[#BEF264] text-black border-black"
-                : "bg-[#FFE066] text-black border-white hover:translate-y-[-2px] hover:shadow-[0px_4px_0px_0px_white] active:translate-y-0 active:shadow-none"
-            }`}
-          >
-            {isDayCompleted ? (
-              <>
-                <Check size={20} strokeWidth={3} /> Completed • Day {currentDay}{" "}
-                Done
-              </>
-            ) : (
-              <>
-                Complete Day {currentDay} • Claim XP <Sparkles size={18} />
-              </>
-            )}
-          </button>
-
-          {isDayCompleted && (
-            <p className="text-center text-[11px] font-bold uppercase tracking-widest opacity-50 mt-2">
-              Come back tomorrow for next lesson
-            </p>
-          )}
-        </div>
-      </div>
-
-      {/* Locked Preview Card */}
-      <div className="bg-white border-[3px] border-black rounded-[24px] p-4 opacity-60 relative overflow-hidden">
-        <div className="absolute inset-0 bg-[repeating-linear-gradient(45deg,transparent,transparent_8px,rgba(0,0,0,0.04)_8px,rgba(0,0,0,0.04)_16px)] pointer-events-none" />
-        <div className="flex items-center gap-3 relative">
-          <div className="w-10 h-10 rounded-full bg-[#FFFBEB] border-[2.5px] border-black flex items-center justify-center">
-            <Lock size={18} />
-          </div>
-          <div className="flex-1">
-            <div className="font-black text-[12px] uppercase tracking-widest">
-              Tomorrow • Day {currentDay + 1}
-            </div>
-            <div className="font-bold text-[14px] leading-tight">
-              {nextLesson.title}
-            </div>
-          </div>
-          <div className="text-[10px] font-black px-2.5 py-1 bg-black text-white rounded-full uppercase">
-            Locked
-          </div>
-        </div>
-      </div>
+      <section className="bg-black text-white border-[3px] border-black rounded-[20px] p-4">
+        <div className="flex items-center gap-2 mb-3"><Trophy size={17} className="text-[#FFE066]" /><h2 className="font-black text-[15px] uppercase tracking-widest">Today&apos;s progress</h2></div>
+        <div className="grid grid-cols-3 gap-2 text-center"><div><div className="text-[22px] font-black">{Math.min(3, actionsComplete)} / 3</div><div className="text-[9px] font-black uppercase opacity-60">Actions</div></div><div><div className="text-[22px] font-black">+{todayEntries.reduce((sum, entry) => sum + entry.xp, 0) + (realWorldDone ? 15 : 0)} XP</div><div className="text-[9px] font-black uppercase opacity-60">Earned today</div></div><div><div className="text-[22px] font-black">{todayEntries.length}</div><div className="text-[9px] font-black uppercase opacity-60">Completed</div></div></div>
+      </section>
     </div>
   );
 };

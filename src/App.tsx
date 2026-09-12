@@ -12,6 +12,8 @@ import { CommunityTab } from "./components/CommunityTab";
 import { ProModal } from "./components/ProModal";
 import { HotTakeModal } from "./components/HotTakeModal";
 import { AuthContainer } from "./components/auth/AuthContainer";
+import { AuthCallbackPage, ForgotPasswordPage, ResetPasswordPage } from "./components/auth/AuthRoutes";
+import { useAuth } from "./context/AuthContext";
 import { getTodayHotTake } from "./data/hotTakes";
 import {
   getCurrentUser,
@@ -32,7 +34,8 @@ function getTodayStr(): string {
 }
 
 export default function App() {
-  const [currentUser, setCurrentUser] = useState<AuthUser | null>(() => getCurrentUser());
+  const { user: supabaseUser, session, loading: authLoading, signOut: supabaseSignOut } = useAuth();
+  const [currentUser, setCurrentUser] = useState<AuthUser | null>(null);
   const [isGuest, setIsGuest] = useState(false);
   const [showAuthView, setShowAuthView] = useState<AuthView | null>(null);
 
@@ -56,9 +59,14 @@ export default function App() {
     );
   });
 
-  const [activeTab, setActiveTab] = useState<AppTab>(() =>
-    window.location.pathname === "/admin" ? "admin" : "today"
-  );
+  const [activeTab, setActiveTab] = useState<AppTab>(() => {
+    const path = window.location.pathname;
+    if (path === "/coach") return "coach";
+    if (path === "/community") return "community";
+    if (path === "/profile") return "profile";
+    if (path === "/admin") return "admin";
+    return "today";
+  });
   const [adminSettings, setAdminSettings] = useState<AdminSettings>(() => getAdminSettings());
   const [dismissedNotificationIds, setDismissedNotificationIds] = useState<string[]>(() => {
     try {
@@ -96,22 +104,31 @@ export default function App() {
   // Daily Hot Take state
   const [showHotTakeModal, setShowHotTakeModal] = useState(false);
 
-  // Theme state: "light" (Brutalist Light) vs "dark" (High-contrast Neon Dark)
-  const [theme, setTheme] = useState<"light" | "dark">(() => {
-    const savedTheme = localStorage.getItem("datings_theme");
-    return savedTheme === "dark" ? "dark" : "light";
-  });
-
-  // Sync theme with global CSS class on root element
   useEffect(() => {
-    const root = document.documentElement;
-    if (theme === "dark") {
-      root.classList.add("dark");
-    } else {
-      root.classList.remove("dark");
+    if (!supabaseUser) {
+      setCurrentUser(null);
+      return;
     }
-    localStorage.setItem("datings_theme", theme);
-  }, [theme]);
+    const email = supabaseUser.email || "";
+    setCurrentUser({
+      id: supabaseUser.id,
+      username: supabaseUser.user_metadata?.username || email.split("@")[0] || "member",
+      email,
+      name: supabaseUser.user_metadata?.display_name || email.split("@")[0] || "Member",
+      passwordHash: "",
+      createdAt: supabaseUser.created_at,
+      lastLoginAt: new Date().toISOString(),
+      profile: profile || undefined,
+      progress,
+      messages,
+    });
+  }, [messages, profile, progress, supabaseUser]);
+
+  // Remove the retired dark-mode preference from existing sessions.
+  useEffect(() => {
+    document.documentElement.classList.remove("dark");
+    localStorage.removeItem("datings_theme");
+  }, []);
 
   useEffect(() => {
     const refreshAdminSettings = () => setAdminSettings(getAdminSettings());
@@ -123,27 +140,8 @@ export default function App() {
     };
   }, []);
 
-  const toggleTheme = () => {
-    setTheme((prev) => (prev === "dark" ? "light" : "dark"));
-  };
-
   // Load local storage on mount
   useEffect(() => {
-    const savedUser = getCurrentUser();
-    if (savedUser) {
-      setCurrentUser(savedUser);
-      if (savedUser.profile) setProfile(savedUser.profile);
-      if (savedUser.progress) {
-        setProgress(savedUser.progress);
-        const todayStr = new Date().toDateString();
-        if (savedUser.progress.lastCompletedDate === todayStr) {
-          setIsDayCompleted(true);
-        }
-      }
-      if (savedUser.avatarUrl) setAvatarUrl(savedUser.avatarUrl);
-      if (savedUser.isPro !== undefined) setIsPro(savedUser.isPro);
-    }
-
     const savedProfile = localStorage.getItem("datings_profile");
     const savedProgress = localStorage.getItem("datings_progress");
     const savedChat = localStorage.getItem("datings_chat");
@@ -153,11 +151,11 @@ export default function App() {
     const savedAvatar = localStorage.getItem("datings_avatar");
     const savedScreenshots = localStorage.getItem("datings_screenshots");
 
-    if (!savedUser && savedProfile) {
+    if (savedProfile) {
       try { setProfile(JSON.parse(savedProfile)); } catch {}
     }
 
-    if (!savedUser && savedProgress) {
+    if (savedProgress) {
       try {
         const prog = JSON.parse(savedProgress);
         setProgress(prog);
@@ -172,13 +170,13 @@ export default function App() {
       try { setMessages(JSON.parse(savedChat)); } catch {}
     }
 
-    if (!savedUser && savedAvatar) setAvatarUrl(savedAvatar);
+    if (savedAvatar) setAvatarUrl(savedAvatar);
 
     if (savedScreenshots) {
       try { setScreenshots(JSON.parse(savedScreenshots)); } catch {}
     }
 
-    if (!savedUser && savedIsPro) setIsPro(savedIsPro === "true");
+    if (savedIsPro) setIsPro(savedIsPro === "true");
 
     const todayDate = getTodayStr();
     if (savedLastChatDate) {
@@ -256,7 +254,12 @@ export default function App() {
 
   useEffect(() => {
     const handleRouteChange = () => {
-      setActiveTab(window.location.pathname === "/admin" ? "admin" : "today");
+      const path = window.location.pathname;
+      if (path === "/coach") setActiveTab("coach");
+      else if (path === "/community") setActiveTab("community");
+      else if (path === "/profile") setActiveTab("profile");
+      else if (path === "/admin") setActiveTab("admin");
+      else setActiveTab("today");
     };
 
     window.addEventListener("popstate", handleRouteChange);
@@ -274,7 +277,7 @@ export default function App() {
 
   const handleSelectTab = (tab: AppTab) => {
     setActiveTab(tab);
-    const nextPath = tab === "admin" ? "/admin" : "/";
+    const nextPath = tab === "admin" ? "/admin" : tab === "today" ? "/dashboard" : `/${tab}`;
     if (window.location.pathname !== nextPath) {
       window.history.pushState({}, "", nextPath);
     }
@@ -314,8 +317,8 @@ export default function App() {
   };
 
   const handleSignOut = () => {
+    void supabaseSignOut();
     saveCurrentUser(null);
-    setCurrentUser(null);
     setIsGuest(false);
     setShowAuthView(null);
   };
@@ -421,6 +424,88 @@ export default function App() {
     setTimeout(() => setShowConfetti(false), 3000);
   };
 
+  const handleQuickFix = (problem: string) => {
+    const coachContext: ChatMessage = {
+      id: `quick-fix-${Date.now()}`,
+      role: "coach",
+      text: `I've got you. You said: "${problem}". Show me the last few messages or tell me what happened and I'll help you figure out what to do next.`,
+      time: "now",
+      options: ["Show me what to text", "Roast the situation", "Give me a low-pressure move"],
+    };
+    setMessages((previous) => [...previous, coachContext]);
+    handleSelectTab("coach");
+  };
+
+  const handleOpenCoachContext = (context: string) => {
+    setMessages((previous) => [
+      ...previous,
+      {
+        id: `community-context-${Date.now()}`,
+        role: "coach",
+        text: `${context}\n\nTell me what happened and I will help you apply it.`,
+        time: "now",
+        options: ["Show me an example", "Apply this to my chat"],
+      },
+    ]);
+    handleSelectTab("coach");
+  };
+
+  const handleCommunityXp = (amount: number, reason: string) => {
+    const transactionKey = `datings_community_xp_${getTodayStr()}_${reason}`;
+    if (localStorage.getItem(transactionKey)) return;
+    localStorage.setItem(transactionKey, "1");
+    setProgress((previous) => ({
+      ...previous,
+      xp: previous.xp + amount,
+      journal: [
+        {
+          id: `community-${Date.now()}`,
+          date: new Date().toISOString(),
+          day: currentDay,
+          lessonTitle: reason,
+          reflection: "Community learning activity",
+          xp: amount,
+        },
+        ...previous.journal,
+      ],
+    }));
+  };
+
+  const handlePracticeToday = (lessonId?: number) => {
+    if (lessonId) {
+      const lesson = LESSONS.find((item) => item.id === lessonId);
+      if (lesson) {
+        setAdminSettings((previous) => ({
+          ...previous,
+          dailyOverride: { ...previous.dailyOverride, lessonId, updatedAt: new Date().toISOString() },
+        }));
+      }
+    }
+    handleSelectTab("today");
+  };
+
+  const handleUpdateProfile = (nextProfile: UserProfile) => {
+    setProfile(nextProfile);
+    if (currentUser) updateCurrentUserData({ profile: nextProfile });
+  };
+
+  const handlePracticeComplete = (scenario: string, score: number) => {
+    const reward = Math.max(10, Math.round(score / 5));
+    const entry = {
+      id: `practice-${Date.now()}`,
+      date: new Date().toISOString(),
+      day: currentDay,
+      lessonTitle: `AI practice: ${scenario}`,
+      reflection: `Simulation score: ${score}/100`,
+      xp: reward,
+    };
+    setProgress((previous) => ({
+      ...previous,
+      xp: previous.xp + reward,
+      journal: [entry, ...previous.journal],
+    }));
+  };
+
   const handleUpdateDailyFocus = (focus: string) => {
     setProgress((prev) => {
       const updated = { ...prev, dailyFocus: focus };
@@ -429,7 +514,24 @@ export default function App() {
     });
   };
 
-  const handleSendMessage = async (text?: string, imageBase64?: string) => {
+  const handleNewCoachSession = () => {
+    setMessages([]);
+    setIsTyping(false);
+  };
+
+  const handleCoachMessageFeedback = (messageId: string, helpful: boolean) => {
+    const feedback = JSON.parse(localStorage.getItem("datings_coach_feedback") || "[]");
+    localStorage.setItem(
+      "datings_coach_feedback",
+      JSON.stringify([...feedback, { messageId, helpful, createdAt: new Date().toISOString() }].slice(-100))
+    );
+  };
+
+  const handleSendMessage = async (
+    text?: string,
+    imageBase64?: string,
+    mode: "gentle" | "direct" | "brutal" = "direct"
+  ) => {
     const userText = text || "";
     if (!userText && !imageBase64) return;
 
@@ -461,9 +563,14 @@ export default function App() {
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           message: userText,
-          vibe: profile?.vibe || "roasty",
+          vibe: mode,
           history: messages,
           imageBase64,
+          profile: {
+            goal: profile?.goal,
+            blocker: profile?.blocker,
+            experience: profile?.experience,
+          },
         }),
       });
 
@@ -473,7 +580,7 @@ export default function App() {
       const botMessage: ChatMessage = {
         id: (Date.now() + 1).toString(),
         role: "coach",
-        text: data.text,
+        text: data.text || "COACH'S TAKE\nSomething went sideways. Try sending that again.",
         time: "now",
         isAi: data.isAi,
         options: getFollowUpOptions(userText, data.text),
@@ -505,7 +612,6 @@ export default function App() {
   };
 
   const handleResetData = () => {
-    if (!confirm("Reset everything? Your streak will be gone fr.")) return;
     localStorage.clear();
     setProfile(null);
     setProgress({
@@ -576,16 +682,28 @@ export default function App() {
     setMessages((prev) => [...prev, proMessage]);
   };
 
-  if (!currentUser && !isGuest) {
+  const pathname = window.location.pathname;
+  if (authLoading) {
+    return <div className="min-h-screen bg-[#FFFBEB] flex items-center justify-center font-black">CHECKING YOUR SESSION...</div>;
+  }
+  if (pathname === "/auth/callback") return <AuthCallbackPage />;
+  if (pathname === "/auth/reset-password") return <ResetPasswordPage />;
+  if (pathname === "/forgot-password") return <ForgotPasswordPage />;
+
+  const isPublicAuthPath = pathname === "/login" || pathname === "/signup" || pathname === "/";
+  if (!supabaseUser && !isGuest) {
+    if (!isPublicAuthPath) window.history.replaceState({}, "", "/login");
     return (
       <AuthContainer
         onAuthSuccess={handleAuthSuccess}
-        onContinueAsGuest={() => setIsGuest(true)}
-        initialView="signin"
-        theme={theme}
-        onToggleTheme={toggleTheme}
+        initialView={pathname === "/signup" ? "signup" : "signin"}
       />
     );
+  }
+
+  if (supabaseUser && isPublicAuthPath) {
+    window.history.replaceState({}, "", "/dashboard");
+    setActiveTab("today");
   }
 
   if (!profile) {
@@ -652,8 +770,6 @@ export default function App() {
               onAuthSuccess={handleAuthSuccess}
               initialView={showAuthView}
               onClose={() => setShowAuthView(null)}
-              theme={theme}
-              onToggleTheme={toggleTheme}
             />
           </div>
         </div>
@@ -664,8 +780,6 @@ export default function App() {
         progress={progress}
         avatarUrl={avatarUrl}
             onOpenProfile={() => handleSelectTab("profile")}
-        theme={theme}
-        onToggleTheme={toggleTheme}
         currentUser={currentUser}
         onSignOut={handleSignOut}
         onOpenAuth={handleOpenAuth}
@@ -723,11 +837,9 @@ export default function App() {
             progress={progress}
             isDayCompleted={isDayCompleted}
             onCompleteDay={handleCompleteDay}
-            triggerConfetti={() => setShowConfetti(true)}
-            onUpdateDailyFocus={handleUpdateDailyFocus}
-            onOpenHotTake={() => setShowHotTakeModal(true)}
-            todayHotTakeTopic={todayHotTake.topic}
-            adminFocus={adminSettings.dailyOverride.focus}
+            onQuickFix={handleQuickFix}
+            onPracticeComplete={handlePracticeComplete}
+            onRealWorldComplete={() => handleCompleteDay("Completed today's real-world move", false)}
             adminNote={adminSettings.dailyOverride.note}
           />
         )}
@@ -741,6 +853,8 @@ export default function App() {
             chatsUsedToday={chatsUsedToday}
             maxFreeChats={MAX_FREE_CHATS}
             onOpenProModal={() => setShowProModal(true)}
+            onNewSession={handleNewCoachSession}
+            onMessageFeedback={handleCoachMessageFeedback}
             isTyping={isTyping}
           />
         )}
@@ -750,6 +864,12 @@ export default function App() {
             settings={adminSettings}
             isAdmin={adminAllowed}
             onOpenAdmin={() => handleSelectTab("admin")}
+            userId={currentUser?.id}
+            profile={profile}
+            progress={progress}
+            onOpenCoach={handleOpenCoachContext}
+            onPracticeToday={handlePracticeToday}
+            onAwardXp={handleCommunityXp}
           />
         )}
 
@@ -766,14 +886,15 @@ export default function App() {
             onOpenProModal={() => setShowProModal(true)}
             onResetData={handleResetData}
             onOpenCoachTab={() => handleSelectTab("coach")}
+            onOpenCoachContext={handleOpenCoachContext}
+            onUpdateProfile={handleUpdateProfile}
+            onAwardXp={handleCommunityXp}
             chatsUsedToday={chatsUsedToday}
             maxFreeChats={MAX_FREE_CHATS}
             onDowngradeToFree={() => {
               setIsPro(false);
               setChatsUsedToday(0);
             }}
-            theme={theme}
-            onSelectTheme={setTheme}
             currentUser={currentUser}
             onSignOut={handleSignOut}
             onOpenAuth={handleOpenAuth}

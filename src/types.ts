@@ -86,6 +86,7 @@ export interface UserProgress {
   badges: string[];
   lessonsViewed: number[];
   dailyFocus?: string;
+  skillScores?: Record<string, number>;
 }
 
 export interface Task {

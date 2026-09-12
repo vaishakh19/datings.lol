@@ -1,5 +1,5 @@
 import React, { useState, useEffect, useRef } from "react";
-import { Flame, Zap, User, Sun, Moon, LogIn, LogOut } from "lucide-react";
+import { Flame, Zap, User, LogIn } from "lucide-react";
 import { motion, AnimatePresence } from "motion/react";
 import { UserProgress, AuthUser, AuthView } from "../types";
 import { getRankInfo } from "../data/lessons";
@@ -8,8 +8,6 @@ interface HeaderProps {
   progress: UserProgress;
   avatarUrl: string | null;
   onOpenProfile: () => void;
-  theme?: "light" | "dark";
-  onToggleTheme?: () => void;
   currentUser?: AuthUser | null;
   onSignOut?: () => void;
   onOpenAuth?: (view?: AuthView) => void;
@@ -20,8 +18,6 @@ export const Header: React.FC<HeaderProps> = ({
   progress,
   avatarUrl,
   onOpenProfile,
-  theme = "light",
-  onToggleTheme,
   currentUser,
   onSignOut,
   onOpenAuth,
@@ -167,22 +163,6 @@ export const Header: React.FC<HeaderProps> = ({
             <Zap size={13} className="fill-black" />
             <span className="font-black text-[12px] sm:text-[13px]">{progress.xp}</span>
           </div>
-
-          {/* Theme switcher button */}
-          {onToggleTheme && (
-            <button
-              onClick={onToggleTheme}
-              className="w-9 h-9 bg-white dark:bg-[#1A1A1A] border-[2.5px] border-black rounded-full flex items-center justify-center brutal-shadow-sm active:translate-y-[1px] active:shadow-none transition-transform cursor-pointer"
-              title={`Switch to ${theme === "dark" ? "Brutalist Light" : "Neon Dark"} mode`}
-              aria-label="Toggle theme"
-            >
-              {theme === "dark" ? (
-                <Sun size={17} className="text-[#FFE066] fill-[#FFE066]" />
-              ) : (
-                <Moon size={17} className="text-black" />
-              )}
-            </button>
-          )}
 
           {/* Current User Pill or Sign In Button */}
           {currentUser ? (
