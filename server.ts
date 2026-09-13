@@ -603,9 +603,9 @@ async function startServer() {
     });
   }
 
-  app.listen(PORT, "0.0.0.0", () => {
-    console.log(`Datings.lol server running at http://0.0.0.0:${PORT}`);
+    app.listen(PORT, "localhost", () => {
+    console.log(`Datings.lol Server running at http://localhost:${PORT}`);
   });
-}
+}  // ← ADD THIS
 
 startServer();
