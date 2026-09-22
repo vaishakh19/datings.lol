@@ -103,6 +103,146 @@ function requireUser(res: express.Response, userId: string | null): string | nul
   return userId;
 }
 
+type CoachPlan = "free" | "pro";
+
+async function getCoachPlan(userId: string): Promise<CoachPlan> {
+  const serviceClient = getSupabaseServiceClient();
+  if (!serviceClient) return "free";
+
+  // Pro subscriptions will be connected in the billing step.
+  // Until then, authenticated users are treated as Free.
+  const { data, error } = await serviceClient
+    .from("subscriptions")
+    .select("plan,status")
+    .eq("user_id", userId)
+    .eq("status", "active")
+    .maybeSingle();
+
+  if (error || !data) return "free";
+  return data.plan === "pro" ? "pro" : "free";
+}
+
+async function getCoachUsageToday(userId: string): Promise<number> {
+  const serviceClient = getSupabaseServiceClient();
+  if (!serviceClient) {
+    throw new Error("SUPABASE_SERVICE_ROLE_KEY is required for Coach quota enforcement.");
+  }
+
+  const startOfToday = new Date();
+  startOfToday.setUTCHours(0, 0, 0, 0);
+
+  const { count, error } = await serviceClient
+    .from("coach_usage")
+    .select("id", { count: "exact", head: true })
+    .eq("user_id", userId)
+    .gte("created_at", startOfToday.toISOString());
+
+  if (error) throw new Error(`Coach usage lookup failed: ${error.message}`);
+  return count || 0;
+}
+
+async function recordCoachUsage(
+  userId: string,
+  plan: CoachPlan,
+  model: string | null,
+  inputTokens: number | null = null,
+  outputTokens: number | null = null,
+  totalTokens: number | null = null,
+) {
+  const serviceClient = getSupabaseServiceClient();
+  if (!serviceClient) {
+    throw new Error("SUPABASE_SERVICE_ROLE_KEY is required for Coach usage tracking.");
+  }
+
+  const { error } = await serviceClient.from("coach_usage").insert({
+    user_id: userId,
+    plan,
+    model,
+    input_tokens: inputTokens,
+    output_tokens: outputTokens,
+    total_tokens: totalTokens,
+    request_type: "chat",
+  });
+
+  if (error) throw new Error(`Coach usage record failed: ${error.message}`);
+}
+
+
+async function saveCoachResult(
+  userId: string,
+  situation: string,
+  responseText: string,
+) {
+  const serviceClient = getSupabaseServiceClient();
+  if (!serviceClient) return;
+
+  const takeMatch = responseText.match(
+    /COACH'S TAKE\s*([\s\S]*?)(?=\nDO THIS|\nTRY|$)/i,
+  );
+  const doMatch = responseText.match(
+    /DO THIS\s*([\s\S]*?)(?=\nTRY|$)/i,
+  );
+  const tryMatch = responseText.match(
+    /TRY\s*["“]?([\s\S]*?)["”]?\s*$/i,
+  );
+
+  const analysis = takeMatch?.[1]?.trim() || responseText;
+  const advice = doMatch?.[1]?.trim() || "";
+  const suggestedMessage = tryMatch?.[1]?.trim() || "";
+
+  const { error: historyError } = await serviceClient
+    .from("coach_history")
+    .insert({
+      user_id: userId,
+      situation: situation || "Coach request",
+      analysis,
+      advice,
+      suggested_message: suggestedMessage,
+      action: advice,
+      outcome: "Pending",
+      xp_awarded: 20,
+    });
+
+  if (historyError) {
+    console.error("Failed to save coach history:", historyError);
+    return;
+  }
+
+  const { data: profile, error: profileError } = await serviceClient
+    .from("profiles")
+    .select("xp, level, streak, last_active_date")
+    .eq("id", userId)
+    .maybeSingle();
+
+  if (profileError) {
+    console.error("Failed to fetch profile:", profileError);
+    return;
+  }
+
+  const today = new Date().toISOString().slice(0, 10);
+  const newXp = (profile?.xp || 0) + 20;
+  const newLevel = Math.floor(newXp / 100) + 1;
+
+  let newStreak = profile?.streak || 0;
+  if (profile?.last_active_date !== today) {
+    newStreak += 1;
+  }
+
+  const { error: updateError } = await serviceClient
+    .from("profiles")
+    .update({
+      xp: newXp,
+      level: newLevel,
+      streak: newStreak,
+      last_active_date: today,
+    })
+    .eq("id", userId);
+
+  if (updateError) {
+    console.error("Failed to update profile:", updateError);
+  }
+}
+
 async function requireAdmin(req: express.Request, res: express.Response): Promise<string | null> {
   const userId = await getAuthenticatedUserId(req);
   if (!userId) {
@@ -454,59 +594,128 @@ function getGeminiClient() {
 
 // API endpoint for AI Dating Coach & Chat Roaster
 app.post("/api/coach", async (req, res) => {
+  const userId = await getAuthenticatedUserId(req);
+  if (!userId) {
+    return res.status(401).json({ error: "Authentication required." });
+  }
+
   try {
-    const { message, vibe = "direct", history = [], imageBase64, profile = {} } = req.body;
+    const {
+      message,
+      vibe = "direct",
+      history = [],
+      imageBase64,
+      profile = {},
+    } = req.body;
+
+    const userText =
+      typeof message === "string" ? message.trim().slice(0, 4000) : "";
+
+    if (!userText && !imageBase64) {
+      return res.status(400).json({ error: "Message or image is required." });
+    }
+
+    if (typeof imageBase64 === "string" && imageBase64.length > 8_000_000) {
+      return res.status(400).json({ error: "Image is too large." });
+    }
+
+    const plan = await getCoachPlan(userId);
+    const freeDailyLimit = 3;
+
+    if (plan === "free") {
+      const usedToday = await getCoachUsageToday(userId);
+
+      if (usedToday >= freeDailyLimit) {
+        return res.status(429).json({
+          error: "Daily Coach limit reached.",
+          code: "COACH_DAILY_LIMIT",
+          plan: "free",
+          limit: freeDailyLimit,
+          used: usedToday,
+          remaining: 0,
+        });
+      }
+    }
 
     const ai = getGeminiClient();
 
     let vibeInstruction = "";
     if (vibe === "brutal" || vibe === "roasty") {
-      vibeInstruction = "You are 'lol coach' on datings.lol in BRUTAL mode: blunt, concise, honest, and occasionally funny, but never abusive, degrading, coercive, manipulative, or cruel. Call out double texts, dry replies, pressure, and weak moves, then give a better move.";
+      vibeInstruction =
+        "You are 'lol coach' on datings.lol in BRUTAL mode: blunt, concise, honest, and occasionally funny, but never abusive, degrading, coercive, manipulative, or cruel. Call out double texts, dry replies, pressure, and weak moves, then give a better move.";
     } else if (vibe === "gentle") {
-      vibeInstruction = "You are 'lol coach' on datings.lol - a warm, supportive, encouraging dating coach. Hype the user up, validate their feelings, reduce anxiety, and give clear, confident, actionable advice and reply suggestions.";
+      vibeInstruction =
+        "You are 'lol coach' on datings.lol - a warm, supportive, encouraging dating coach. Hype the user up, validate their feelings, reduce anxiety, and give clear, confident, actionable advice and reply suggestions.";
     } else {
-      vibeInstruction = "You are 'lol coach' on datings.lol - a direct, no-BS dating coach. Concise, tactical, no fluff, straight to the point with actionable steps and exact text templates.";
+      vibeInstruction =
+        "You are 'lol coach' on datings.lol - a direct, no-BS dating coach. Concise, tactical, no fluff, straight to the point with actionable steps and exact text templates.";
     }
 
     const systemInstruction = `${vibeInstruction}
-The user's context is goal=${profile.goal || "unknown"}, blocker=${profile.blocker || "unknown"}, experience=${profile.experience || "unknown"}.
-Classify the request internally as reply_help, conversation_analysis, profile_review, date_preparation, confidence, rejection, asking_out, flirting, overthinking, simulation, or general_coaching.
-Reply in this exact compact structure when appropriate:
+
+The user's context is:
+goal=${profile.goal || "unknown"}
+blocker=${profile.blocker || "unknown"}
+experience=${profile.experience || "unknown"}
+
+You are a practical dating coach.
+
+OUTPUT FORMAT — FOLLOW EXACTLY:
 COACH'S TAKE
-[short analysis]
+[ONE short sentence]
 
 DO THIS
-[one clear action]
+[ONE short sentence]
 
-TRY:
-"[one strongest suggested wording]"
+TRY
+"[ONE short message the user can send]"
 
-WHY:
-[short explanation]
-Give only one strongest recommendation and at most two alternatives. Never claim certainty about another person's feelings. Say 'based on these messages, this could mean...' Keep answers under 180 words unless analyzing an uploaded image.`;
+STRICT RULES:
+- Output ONLY those 3 sections.
+- Use the headings exactly: COACH'S TAKE, DO THIS, TRY.
+- COACH'S TAKE = exactly one short sentence.
+- DO THIS = exactly one short sentence.
+- TRY = exactly one short message in quotation marks.
+- No WHY section.
+- No bullet points.
+- No extra explanation.
+- No paragraphs.
+- Keep the entire response very short.
+- Never claim certainty about another person's feelings.
+- Never encourage manipulation, pressure, harassment, or deception.`;
+
+    let responseText: string | null = null;
+    let usedModel: string | null = null;
+    let inputTokens: number | null = null;
+    let outputTokens: number | null = null;
+    let totalTokens: number | null = null;
 
     if (ai) {
       const contents: any[] = [];
 
-      // Add recent history if provided
       if (Array.isArray(history) && history.length > 0) {
         history.slice(-6).forEach((h: any) => {
           if (h.text) {
             contents.push({
               role: h.role === "user" ? "user" : "model",
-              parts: [{ text: h.text }],
+              parts: [{ text: String(h.text).slice(0, 3000) }],
             });
           }
         });
       }
 
-      // Add current message / image
       const currentParts: any[] = [];
+
       if (imageBase64) {
-        // Strip data header if present
-        const cleanedBase64 = imageBase64.replace(/^data:image\/\w+;base64,/, "");
-        const mimeMatch = imageBase64.match(/^data:(image\/\w+);base64,/);
+        const cleanedBase64 = String(imageBase64).replace(
+          /^data:image\/\w+;base64,/,
+          "",
+        );
+        const mimeMatch = String(imageBase64).match(
+          /^data:(image\/\w+);base64,/,
+        );
         const mimeType = mimeMatch ? mimeMatch[1] : "image/jpeg";
+
         currentParts.push({
           inlineData: {
             mimeType,
@@ -515,7 +724,12 @@ Give only one strongest recommendation and at most two alternatives. Never claim
         });
       }
 
-      const userPrompt = message || (imageBase64 ? "Roast this chat / profile screenshot and give me actionable fixes." : "Give me dating advice.");
+      const userPrompt =
+        userText ||
+        (imageBase64
+          ? "Roast this chat / profile screenshot and give me actionable fixes."
+          : "Give me dating advice.");
+
       currentParts.push({ text: userPrompt });
 
       contents.push({
@@ -523,9 +737,11 @@ Give only one strongest recommendation and at most two alternatives. Never claim
         parts: currentParts,
       });
 
-      // Try multiple models / retries in case of temporary 503 high demand
-      const candidateModels = ["gemini-3.8-flash", "gemini-flash-latest", "gemini-2.5-flash"];
-      let responseText: string | null = null;
+      const candidateModels = [
+        "gemini-3.8-flash",
+        "gemini-flash-latest",
+        "gemini-2.5-flash",
+      ];
 
       for (const model of candidateModels) {
         try {
@@ -534,32 +750,90 @@ Give only one strongest recommendation and at most two alternatives. Never claim
             contents,
             config: {
               systemInstruction,
-              temperature: 0.9,
+              temperature: 0.7,
+              maxOutputTokens: 80,
             },
           });
+
           if (response.text) {
             responseText = response.text;
+            usedModel = model;
+
+            const usage = (response as any).usageMetadata;
+            inputTokens =
+              Number(usage?.promptTokenCount ?? usage?.inputTokenCount) || null;
+            outputTokens =
+              Number(usage?.candidatesTokenCount ?? usage?.outputTokenCount) ||
+              null;
+            totalTokens =
+              Number(usage?.totalTokenCount) ||
+              (inputTokens !== null || outputTokens !== null
+                ? (inputTokens || 0) + (outputTokens || 0)
+                : null);
+
             break;
           }
         } catch (modelError: any) {
-          console.warn(`Model ${model} failed, trying next candidate:`, modelError?.message || modelError);
-          // Small delay before trying next fallback model
+          console.warn(
+            `Model ${model} failed, trying next candidate:`,
+            modelError?.message || modelError,
+          );
           await new Promise((resolve) => setTimeout(resolve, 500));
         }
       }
-
-      if (responseText) {
-        return res.json({ text: responseText, isAi: true });
-      }
     }
 
-    // Fallback if no Gemini key or empty response
-    const fallbackText = getFallbackResponse(message, vibe, !!imageBase64);
-    return res.json({ text: fallbackText, isAi: false });
-  } catch (error) {
+    await recordCoachUsage(
+      userId,
+      plan,
+      usedModel,
+      inputTokens,
+      outputTokens,
+      totalTokens,
+    );
+
+    if (responseText) {
+      await saveCoachResult(userId, userText, responseText);
+
+      return res.json({
+        text: responseText,
+        isAi: true,
+        plan,
+        usage: {
+          model: usedModel,
+          inputTokens,
+          outputTokens,
+          totalTokens,
+        },
+      });
+    }
+
+    const fallbackText = getFallbackResponse(
+      userText,
+      vibe,
+      !!imageBase64,
+    );
+
+    await saveCoachResult(userId, userText, fallbackText);
+
+    return res.json({
+      text: fallbackText,
+      isAi: false,
+      plan,
+      usage: {
+        model: null,
+        inputTokens: null,
+        outputTokens: null,
+        totalTokens: null,
+      },
+    });
+  } catch (error: any) {
     console.error("Error in /api/coach:", error);
-    const fallbackText = getFallbackResponse(req.body?.message, req.body?.vibe, !!req.body?.imageBase64);
-    return res.json({ text: fallbackText, isAi: false });
+
+    return res.status(500).json({
+      error: "Coach is temporarily unavailable. Please try again.",
+      code: "COACH_SERVER_ERROR",
+    });
   }
 });
 

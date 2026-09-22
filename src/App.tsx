@@ -7,6 +7,7 @@ import { Navigation } from "./components/Navigation";
 import { TodayTab } from "./components/TodayTab";
 import { CoachTab } from "./components/CoachTab";
 import { ProfileTab } from "./components/ProfileTab";
+import { SupportTab } from "./components/SupportTab";
 import { AdminTab } from "./components/AdminTab";
 import { CommunityTab } from "./components/CommunityTab";
 import { ProModal } from "./components/ProModal";
@@ -24,7 +25,7 @@ import {
   getActiveAdminNotification,
   getAdminSettings,
   isAdminUser,
-  saveAdminSettings,
+  saveAdminSettings, 
 } from "./utils/adminStorage";
 
 const MAX_FREE_CHATS = 3;
@@ -560,7 +561,12 @@ export default function App() {
     try {
       const res = await fetch("/api/coach", {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        headers: {
+          "Content-Type": "application/json",
+          ...(session?.access_token
+            ? { Authorization: `Bearer ${session.access_token}` }
+            : {}),
+        },
         body: JSON.stringify({
           message: userText,
           vibe: mode,
