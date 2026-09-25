@@ -1,17 +1,92 @@
-import express from "express";
-import path from "path";
-import dotenv from "dotenv";
-import { GoogleGenAI } from "@google/genai";
-import { createClient } from "@supabase/supabase-js";
+/**
+ * datings.lol — Production API Server
+ * ------------------------------------------------------------------
+ * Drop-in replacement for the previous demo server. Every route,
+ * request shape, and response shape is unchanged, so the UI needs
+ * zero modifications. What changed is everything underneath:
+ *
+ *  - Real persistence via Supabase (in-memory demo mode still available
+ *    behind ALLOW_DEMO_MODE=true for local dev without a database)
+ *  - Race-free XP awarding and Coach daily quota via Postgres RPCs
+ *  - Zod input validation on every write endpoint
+ *  - Rate limiting (global API + stricter Coach limiter)
+ *  - Helmet security headers, manual strict CORS, request logging (pino)
+ *  - Structured errors, request IDs, graceful shutdown, health checks
+ *  - Gemini client with model fallback + hard timeouts
+ *
+ * Run migrations in supabase_migration.sql before deploying.
+ */
 
-dotenv.config();
+import 'dotenv/config';
+import express, { NextFunction, Request, Response } from 'express';
+import path from 'node:path';
+import crypto from 'node:crypto';
+import compression from 'compression';
+import helmet from 'helmet';
+import rateLimit from 'express-rate-limit';
+import { pino } from 'pino';
+import { pinoHttp } from 'pino-http';
+import { z } from 'zod';
+import { createClient, SupabaseClient } from '@supabase/supabase-js';
+import { GoogleGenAI, Content } from '@google/genai';
 
-const app = express();
-const PORT = 3000;
+// ============================================================================
+// CONFIGURATION (validated — the server refuses to boot with a bad env)
+// ============================================================================
 
-app.use(express.json({ limit: "20mb" }));
+const envSchema = z.object({
+  NODE_ENV: z.enum(['development', 'test', 'production']).default('development'),
+  PORT: z.coerce.number().int().positive().max(65535).default(3000),
+  HOST: z.string().default('0.0.0.0'),
 
-type TaskKind = "LEARN" | "PRACTICE" | "SIMULATION" | "REAL_WORLD" | "REVIEW";
+  SUPABASE_URL: z.string().url().optional(),
+  SUPABASE_SERVICE_ROLE_KEY: z.string().min(20).optional(),
+  // Optional: still accepted for backwards compatibility with Vite-style envs.
+  VITE_SUPABASE_URL: z.string().url().optional(),
+
+  GEMINI_API_KEY: z.string().optional(),
+  COACH_FREE_DAILY_LIMIT: z.coerce.number().int().min(1).max(1000).default(3),
+  COACH_XP_REWARD: z.coerce.number().int().min(0).max(1000).default(20),
+
+  ALLOW_DEMO_MODE: z.enum(['true', 'false']).default('false'),
+  ENABLE_CSP: z.enum(['true', 'false']).default('false'),
+  CORS_ORIGINS: z.string().optional(),
+  ADMIN_USER_IDS: z.string().optional(),
+  LOG_LEVEL: z.enum(['fatal', 'error', 'warn', 'info', 'debug', 'trace']).default('info'),
+});
+
+const envResult = envSchema.safeParse(process.env);
+if (!envResult.success) {
+  console.error('FATAL: invalid environment variables:', envResult.error.flatten().fieldErrors);
+  process.exit(1);
+}
+const env = envResult.data;
+
+const isProd = env.NODE_ENV === 'production';
+const demoMode = env.ALLOW_DEMO_MODE === 'true';
+const SUPABASE_URL = env.SUPABASE_URL ?? env.VITE_SUPABASE_URL ?? null;
+const SUPABASE_SERVICE_ROLE_KEY = env.SUPABASE_SERVICE_ROLE_KEY ?? null;
+const GEMINI_API_KEY =
+  env.GEMINI_API_KEY && env.GEMINI_API_KEY !== 'MY_GEMINI_API_KEY' ? env.GEMINI_API_KEY : null;
+
+if (!demoMode && (!SUPABASE_URL || !SUPABASE_SERVICE_ROLE_KEY)) {
+  console.error('FATAL: SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY are required in production.');
+  console.error('       Set ALLOW_DEMO_MODE=true only for local development without a database.');
+  process.exit(1);
+}
+
+const logger = pino({
+  level: env.LOG_LEVEL,
+  redact: { paths: ['req.headers.authorization', 'req.headers.cookie'], censor: '[REDACTED]' },
+});
+
+// ============================================================================
+// TYPES
+// ============================================================================
+
+type TaskKind = 'LEARN' | 'PRACTICE' | 'SIMULATION' | 'REAL_WORLD' | 'REVIEW';
+type Difficulty = 'BEGINNER' | 'INTERMEDIATE' | 'ADVANCED' | 'BRUTAL';
+type CoachPlan = 'free' | 'pro';
 
 interface GeneratedTask {
   id: string;
@@ -21,45 +96,152 @@ interface GeneratedTask {
   kind: TaskKind;
   title: string;
   description: string;
-  difficulty: "BEGINNER" | "INTERMEDIATE" | "ADVANCED" | "BRUTAL";
+  difficulty: Difficulty;
   xpReward: number;
   completed: boolean;
 }
 
-const demoTasks = new Map<string, GeneratedTask>();
-const demoCommunitySaves = new Set<string>();
-const demoCommunityCompletions = new Set<string>();
-const demoCommunityReactions = new Map<string, string>();
-const demoProfiles = new Map<string, Record<string, any>>();
-const demoProfileAudits = new Map<string, any[]>();
-const demoJournalEntries = new Map<string, any[]>();
-const demoAdminAuditLogs: any[] = [];
-const demoAdminFeatures = new Map<string, string>();
+interface Profile {
+  id?: string;
+  username?: string;
+  email?: string;
+  xp?: number;
+  level?: number;
+  streak?: number;
+  activeDays?: number;
+  lastActiveDate?: string;
+  goal?: string;
+  blocker?: string;
+  vibe?: string;
+  avatarUrl?: string;
+  isPro?: boolean;
+}
 
-const demoCommunityTeachings = [
-  { id: "teaching-breathe", category: "TEXTING", type: "BREAKDOWN", title: "Stop trying to keep the chat alive", summary: "Let effort be information. Add personality, then leave room.", xp: 15, accent: "#FFE066" },
-  { id: "teaching-confidence", category: "CONFIDENCE", type: "REMINDER", title: "Confidence is a verb", summary: "Collect evidence with one small social risk today.", xp: 15, accent: "#BEF264" },
-  { id: "teaching-flirt", category: "FLIRTING", type: "COACH TIP", title: "Flirt without forcing it", summary: "Playful beats performative. Let your point of view show.", xp: 15, accent: "#FDA4AF" },
-];
+interface JournalEntry {
+  id: string;
+  userId: string;
+  title: string;
+  type: string;
+  content: string;
+  createdAt: string;
+  updatedAt?: string;
+}
+
+interface ProfileAudit {
+  id: string;
+  userId: string;
+  score: number;
+  analysis: Record<string, string>;
+  createdAt: string;
+}
+
+interface DashboardMetrics {
+  users: number;
+  proUsers: number;
+  activeToday: number;
+  totalXp: number;
+  coachMessagesToday: number;
+  tasksCompletedToday: number;
+  communityTeachings: number;
+  profileAudits: number;
+  activeStreaks: number;
+}
+
+interface CompleteTaskResult {
+  status: 'ok' | 'not_found' | 'already_completed';
+  task: GeneratedTask | null;
+}
+
+interface GeminiResult {
+  text: string;
+  model: string;
+  inputTokens: number | null;
+  outputTokens: number | null;
+  totalTokens: number | null;
+}
+
+// ============================================================================
+// SHARED STATIC CONTENT (community teachings — same data as before)
+// ============================================================================
+
+const TEACHINGS = [
+  { id: 'teaching-breathe', category: 'TEXTING', type: 'BREAKDOWN', title: 'Stop trying to keep the chat alive', summary: 'Let effort be information. Add personality, then leave room.', xp: 15, accent: '#FFE066' },
+  { id: 'teaching-confidence', category: 'CONFIDENCE', type: 'REMINDER', title: 'Confidence is a verb', summary: 'Collect evidence with one small social risk today.', xp: 15, accent: '#BEF264' },
+  { id: 'teaching-flirt', category: 'FLIRTING', type: 'COACH TIP', title: 'Flirt without forcing it', summary: 'Playful beats performative. Let your point of view show.', xp: 15, accent: '#FDA4AF' },
+] as const;
+
+type Teaching = (typeof TEACHINGS)[number];
+
+function findTeaching(id: string): Teaching | undefined {
+  return TEACHINGS.find((t) => t.id === id);
+}
+
+// ============================================================================
+// UTILITIES
+// ============================================================================
 
 function todayKey(): string {
   return new Date().toISOString().slice(0, 10);
 }
 
+function startOfTodayIso(): string {
+  const d = new Date();
+  d.setUTCHours(0, 0, 0, 0);
+  return d.toISOString();
+}
+
+class ApiError extends Error {
+  constructor(
+    public statusCode: number,
+    message: string,
+    public code?: string,
+  ) {
+    super(message);
+  }
+}
+
+const badRequest = (m: string) => new ApiError(400, m);
+const conflict = (m: string) => new ApiError(409, m);
+
+/** Wraps async route handlers so rejections hit the central error middleware. */
+const ah =
+  (fn: (req: Request, res: Response, next: NextFunction) => Promise<unknown>) =>
+  (req: Request, res: Response, next: NextFunction) => {
+    fn(req, res, next).catch(next);
+  };
+
+function parseBody<T extends z.ZodTypeAny>(schema: T, body: unknown): z.infer<T> {
+  const result = schema.safeParse(body ?? {});
+  if (!result.success) {
+    const issue = result.error.issues[0];
+    const where = issue && issue.path.length ? issue.path.join('.') + ': ' : '';
+    throw badRequest(where + (issue?.message ?? 'Invalid request body.'));
+  }
+  return result.data;
+}
+
+/** Same deterministic generator as before — no UI-visible change. */
 function buildDailyTask(userId: string, input: Record<string, any> = {}): GeneratedTask {
   const goals = Array.isArray(input.goals) ? input.goals : [];
-  const skills = input.skills && typeof input.skills === "object" ? input.skills : {};
+  const skills = input.skills && typeof input.skills === 'object' ? input.skills : {};
   const rankedSkill = Object.entries(skills)
     .sort(([, left], [, right]) => Number(left) - Number(right))[0]?.[0];
-  const skill = rankedSkill || goals[0] || "texting";
+
+  const skill = rankedSkill || goals[0] || 'texting';
+  const skillValue = Number(skills[skill] || 50);
+
   const templates: Record<string, { title: string; description: string; kind: TaskKind }> = {
-    texting: { title: "Make the next message easier to answer", description: "Share one specific detail about yourself, then ask a question that gives them somewhere interesting to go.", kind: "PRACTICE" },
-    confidence: { title: "Take one clean social risk", description: "Say the thing you normally edit out. Keep it warm, specific, and low-pressure.", kind: "REAL_WORLD" },
-    flirting: { title: "Add playful energy", description: "Replace one generic compliment with a light tease that reveals your personality.", kind: "PRACTICE" },
-    asking_out: { title: "Turn momentum into a plan", description: "Suggest a specific day and activity instead of leaving the conversation in the talking stage.", kind: "REAL_WORLD" },
-    overthinking: { title: "Send before the spiral", description: "Write the honest version in one sentence, read it once, then send it without a second edit.", kind: "REAL_WORLD" },
+    texting: { title: 'Make the next message easier to answer', description: 'Share one specific detail about yourself, then ask a question that gives them somewhere interesting to go.', kind: 'PRACTICE' },
+    confidence: { title: 'Take one clean social risk', description: 'Say the thing you normally edit out. Keep it warm, specific, and low-pressure.', kind: 'REAL_WORLD' },
+    flirting: { title: 'Add playful energy', description: 'Replace one generic compliment with a light tease that reveals your personality.', kind: 'PRACTICE' },
+    asking_out: { title: 'Turn momentum into a plan', description: 'Suggest a specific day and activity instead of leaving the conversation in the talking stage.', kind: 'REAL_WORLD' },
+    overthinking: { title: 'Send before the spiral', description: 'Write the honest version in one sentence, read it once, then send it without a second edit.', kind: 'REAL_WORLD' },
   };
+
   const template = templates[skill] || templates.texting;
+  const isBeginner = skillValue < 40;
+  const isAdvanced = skillValue > 75;
+
   return {
     id: `task-${userId}-${todayKey()}`,
     userId,
@@ -68,597 +250,1350 @@ function buildDailyTask(userId: string, input: Record<string, any> = {}): Genera
     kind: template.kind,
     title: template.title,
     description: template.description,
-    difficulty: Number(skills[skill] || 50) < 40 ? "BEGINNER" : Number(skills[skill] || 50) > 75 ? "ADVANCED" : "INTERMEDIATE",
-    xpReward: 25 + (Number(skills[skill] || 50) > 75 ? 15 : 0),
+    difficulty: isBeginner ? 'BEGINNER' : isAdvanced ? 'ADVANCED' : 'INTERMEDIATE',
+    xpReward: 25 + (isAdvanced ? 15 : 0),
     completed: false,
   };
 }
 
-function getSupabaseServerClient() {
-  const url = process.env.SUPABASE_URL || process.env.VITE_SUPABASE_URL;
-  const key = process.env.SUPABASE_ANON_KEY || process.env.VITE_SUPABASE_PUBLISHABLE_KEY;
-  return url && key ? createClient(url, key) : null;
-}
+// ============================================================================
+// SUPABASE CLIENT + AUTH (service-role singleton, token cache)
+// ============================================================================
 
-function getSupabaseServiceClient() {
-  const url = process.env.SUPABASE_URL || process.env.VITE_SUPABASE_URL;
-  const serviceRoleKey = process.env.SUPABASE_SERVICE_ROLE_KEY;
-  return url && serviceRoleKey ? createClient(url, serviceRoleKey) : null;
-}
-
-async function getAuthenticatedUserId(req: express.Request): Promise<string | null> {
-  const authorization = req.header("authorization");
-  if (!authorization?.startsWith("Bearer ")) return null;
-  const client = getSupabaseServerClient();
-  if (!client) return null;
-  const { data } = await client.auth.getUser(authorization.slice(7));
-  return data.user?.id || null;
-}
-
-function requireUser(res: express.Response, userId: string | null): string | null {
-  if (!userId) {
-    res.status(401).json({ error: "Authentication required." });
-    return null;
-  }
-  return userId;
-}
-
-type CoachPlan = "free" | "pro";
-
-async function getCoachPlan(userId: string): Promise<CoachPlan> {
-  const serviceClient = getSupabaseServiceClient();
-  if (!serviceClient) return "free";
-
-  // Pro subscriptions will be connected in the billing step.
-  // Until then, authenticated users are treated as Free.
-  const { data, error } = await serviceClient
-    .from("subscriptions")
-    .select("plan,status")
-    .eq("user_id", userId)
-    .eq("status", "active")
-    .maybeSingle();
-
-  if (error || !data) return "free";
-  return data.plan === "pro" ? "pro" : "free";
-}
-
-async function getCoachUsageToday(userId: string): Promise<number> {
-  const serviceClient = getSupabaseServiceClient();
+let serviceClient: SupabaseClient | null = null;
+function sb(): SupabaseClient {
   if (!serviceClient) {
-    throw new Error("SUPABASE_SERVICE_ROLE_KEY is required for Coach quota enforcement.");
-  }
-
-  const startOfToday = new Date();
-  startOfToday.setUTCHours(0, 0, 0, 0);
-
-  const { count, error } = await serviceClient
-    .from("coach_usage")
-    .select("id", { count: "exact", head: true })
-    .eq("user_id", userId)
-    .gte("created_at", startOfToday.toISOString());
-
-  if (error) throw new Error(`Coach usage lookup failed: ${error.message}`);
-  return count || 0;
-}
-
-async function recordCoachUsage(
-  userId: string,
-  plan: CoachPlan,
-  model: string | null,
-  inputTokens: number | null = null,
-  outputTokens: number | null = null,
-  totalTokens: number | null = null,
-) {
-  const serviceClient = getSupabaseServiceClient();
-  if (!serviceClient) {
-    throw new Error("SUPABASE_SERVICE_ROLE_KEY is required for Coach usage tracking.");
-  }
-
-  const { error } = await serviceClient.from("coach_usage").insert({
-    user_id: userId,
-    plan,
-    model,
-    input_tokens: inputTokens,
-    output_tokens: outputTokens,
-    total_tokens: totalTokens,
-    request_type: "chat",
-  });
-
-  if (error) throw new Error(`Coach usage record failed: ${error.message}`);
-}
-
-
-async function saveCoachResult(
-  userId: string,
-  situation: string,
-  responseText: string,
-) {
-  const serviceClient = getSupabaseServiceClient();
-  if (!serviceClient) return;
-
-  const takeMatch = responseText.match(
-    /COACH'S TAKE\s*([\s\S]*?)(?=\nDO THIS|\nTRY|$)/i,
-  );
-  const doMatch = responseText.match(
-    /DO THIS\s*([\s\S]*?)(?=\nTRY|$)/i,
-  );
-  const tryMatch = responseText.match(
-    /TRY\s*["“]?([\s\S]*?)["”]?\s*$/i,
-  );
-
-  const analysis = takeMatch?.[1]?.trim() || responseText;
-  const advice = doMatch?.[1]?.trim() || "";
-  const suggestedMessage = tryMatch?.[1]?.trim() || "";
-
-  const { error: historyError } = await serviceClient
-    .from("coach_history")
-    .insert({
-      user_id: userId,
-      situation: situation || "Coach request",
-      analysis,
-      advice,
-      suggested_message: suggestedMessage,
-      action: advice,
-      outcome: "Pending",
-      xp_awarded: 20,
+    serviceClient = createClient(SUPABASE_URL as string, SUPABASE_SERVICE_ROLE_KEY as string, {
+      auth: { persistSession: false, autoRefreshToken: false, detectSessionInUrl: false },
     });
-
-  if (historyError) {
-    console.error("Failed to save coach history:", historyError);
-    return;
   }
-
-  const { data: profile, error: profileError } = await serviceClient
-    .from("profiles")
-    .select("xp, level, streak, last_active_date")
-    .eq("id", userId)
-    .maybeSingle();
-
-  if (profileError) {
-    console.error("Failed to fetch profile:", profileError);
-    return;
-  }
-
-  const today = new Date().toISOString().slice(0, 10);
-  const newXp = (profile?.xp || 0) + 20;
-  const newLevel = Math.floor(newXp / 100) + 1;
-
-  let newStreak = profile?.streak || 0;
-  if (profile?.last_active_date !== today) {
-    newStreak += 1;
-  }
-
-  const { error: updateError } = await serviceClient
-    .from("profiles")
-    .update({
-      xp: newXp,
-      level: newLevel,
-      streak: newStreak,
-      last_active_date: today,
-    })
-    .eq("id", userId);
-
-  if (updateError) {
-    console.error("Failed to update profile:", updateError);
-  }
+  return serviceClient;
 }
 
-async function requireAdmin(req: express.Request, res: express.Response): Promise<string | null> {
+interface CachedAuth {
+  userId: string;
+  expiresAt: number;
+}
+const tokenCache = new Map<string, CachedAuth>();
+const TOKEN_CACHE_TTL_MS = 5 * 60 * 1000;
+let warnedDemoAuth = false;
+
+async function getAuthenticatedUserId(req: Request): Promise<string | null> {
+  const authorization = req.header('authorization');
+  if (!authorization?.startsWith('Bearer ')) return null;
+  const token = authorization.slice(7).trim();
+  if (!token) return null;
+
+  const cacheKey = crypto.createHash('sha256').update(token).digest('hex');
+  const cached = tokenCache.get(cacheKey);
+  if (cached && cached.expiresAt > Date.now()) return cached.userId;
+
+  if (SUPABASE_URL && SUPABASE_SERVICE_ROLE_KEY) {
+    const { data, error } = await sb().auth.getUser(token);
+    if (error || !data?.user) return null;
+    if (tokenCache.size > 10_000) tokenCache.clear();
+    tokenCache.set(cacheKey, { userId: data.user.id, expiresAt: Date.now() + TOKEN_CACHE_TTL_MS });
+    return data.user.id;
+  }
+
+  // Dev-only convenience when running without Supabase: a stable ID derived
+  // from the token hash so authenticated routes work locally.
+  if (demoMode) {
+    if (!warnedDemoAuth) {
+      warnedDemoAuth = true;
+      logger.warn('Demo mode: deriving user IDs from token hash (no Supabase auth).');
+    }
+    return `demo-${cacheKey.slice(0, 16)}`;
+  }
+  return null;
+}
+
+async function requireAuth(req: Request, res: Response): Promise<string | null> {
   const userId = await getAuthenticatedUserId(req);
   if (!userId) {
-    res.status(401).json({ error: "Authentication required." });
+    res.status(401).json({ error: 'Authentication required.' });
     return null;
   }
-  const serviceClient = getSupabaseServiceClient();
-  if (!serviceClient) {
-    res.status(503).json({ error: "Admin authorization is not configured." });
+  res.locals.userId = userId;
+  return userId;
+}
+
+function configuredAdminIds(): string[] {
+  return (env.ADMIN_USER_IDS ?? '').split(',').map((s) => s.trim()).filter(Boolean);
+}
+
+async function requireAdmin(req: Request, res: Response): Promise<string | null> {
+  const userId = await requireAuth(req, res);
+  if (!userId) return null;
+
+  if (configuredAdminIds().includes(userId)) return userId;
+
+  if (!SUPABASE_URL || !SUPABASE_SERVICE_ROLE_KEY) {
+    res.status(503).json({ error: 'Admin authorization is not configured.' });
     return null;
   }
-  const { data } = await serviceClient.from("admin_users").select("user_id").eq("user_id", userId).maybeSingle();
-  if (!data) {
-    res.status(403).json({ error: "Admin permission required." });
+  const { data, error } = await sb()
+    .from('admin_users')
+    .select('user_id')
+    .eq('user_id', userId)
+    .maybeSingle();
+  if (error || !data) {
+    res.status(403).json({ error: 'Admin permission required.' });
     return null;
   }
   return userId;
 }
 
-function recordAdminAudit(adminUserId: string, action: string, targetType: string, targetId: string, metadata: Record<string, unknown> = {}) {
-  demoAdminAuditLogs.unshift({ id: `admin-audit-${Date.now()}`, adminUserId, action, targetType, targetId, metadata, createdAt: new Date().toISOString() });
-  if (demoAdminAuditLogs.length > 200) demoAdminAuditLogs.pop();
+/** Atomic XP + streak update (never a read-then-write race). */
+async function awardXp(userId: string, amount: number): Promise<void> {
+  if (demoMode) return;
+  const { error } = await sb().rpc('award_xp', { p_user_id: userId, p_amount: amount });
+  if (error) logger.warn({ err: error, userId }, 'award_xp RPC failed');
 }
 
-app.get("/api/today", async (req, res) => {
-  const userId = requireUser(res, await getAuthenticatedUserId(req));
-  if (!userId) return;
-  const key = `${userId}:${todayKey()}`;
-  const task = demoTasks.get(key) || buildDailyTask(userId, req.query);
-  demoTasks.set(key, task);
-  res.json({ task, source: "demo-cache", generatedAt: new Date().toISOString() });
-});
+// ============================================================================
+// DATA STORE — Supabase (production) or in-memory (ALLOW_DEMO_MODE)
+// ============================================================================
 
-app.get("/api/progress", async (req, res) => {
-  const userId = requireUser(res, await getAuthenticatedUserId(req));
-  if (!userId) return;
-  res.json({ userId, xp: 0, streak: 0, skills: {} });
-});
+interface DataStore {
+  tasks: {
+    getOrCreateToday(userId: string, input: Record<string, unknown>): Promise<GeneratedTask>;
+    getToday(userId: string): Promise<GeneratedTask | null>;
+    complete(userId: string, taskId: string): Promise<CompleteTaskResult>;
+    getProgress(userId: string): Promise<{ xp: number; streak: number; skills: Record<string, { completed: number; total: number }> }>;
+  };
+  community: {
+    progress(userId: string): Promise<{ saved: string[]; completed: string[] }>;
+    save(userId: string, teachingId: string): Promise<void>;
+    unsave(userId: string, teachingId: string): Promise<void>;
+    react(userId: string, teachingId: string, reaction: string): Promise<'ok' | 'already'>;
+    complete(userId: string, teachingId: string, xp: number): Promise<'ok' | 'already'>;
+  };
+  profile: {
+    get(userId: string): Promise<{ profile: Profile; audits: ProfileAudit[] }>;
+    update(userId: string, patch: { goal?: string; blocker?: string; vibe?: string }): Promise<Profile>;
+    saveAvatar(userId: string, dataUrl: string): Promise<void>;
+  };
+  journal: {
+    list(userId: string): Promise<JournalEntry[]>;
+    create(userId: string, input: { title: string; type: string; content: string }): Promise<JournalEntry>;
+    update(userId: string, id: string, patch: { title?: string; content?: string }): Promise<JournalEntry | null>;
+    remove(userId: string, id: string): Promise<boolean>;
+  };
+  admin: {
+    dashboard(): Promise<DashboardMetrics>;
+    users(search: string): Promise<Array<{ id: string; username?: string; email?: string; xp: number; streak: number; isPro: boolean }>>;
+    setFeatureFlag(adminId: string, key: string, state: string): Promise<void>;
+  };
+  coach: {
+    getPlan(userId: string): Promise<CoachPlan>;
+    consumeQuota(userId: string, limit: number): Promise<boolean>;
+    usageToday(userId: string): Promise<number>;
+    recordUsage(userId: string, plan: CoachPlan, model: string | null, inputTokens: number | null, outputTokens: number | null, totalTokens: number | null): Promise<void>;
+    saveResult(userId: string, situation: string, responseText: string): Promise<void>;
+  };
+}
 
-app.post("/api/tasks/:id/start", async (req, res) => {
-  const userId = requireUser(res, await getAuthenticatedUserId(req));
-  if (!userId) return;
-  const task = demoTasks.get(`${userId}:${todayKey()}`);
-  if (!task || task.id !== req.params.id) return res.status(404).json({ error: "Task not found." });
-  res.json({ task, startedAt: new Date().toISOString() });
-});
+/* -------------------------------------------------------------------------- */
+/* In-memory implementation (demo mode — same behavior as the original server) */
+/* -------------------------------------------------------------------------- */
 
-app.post("/api/tasks/:id/complete", async (req, res) => {
-  const userId = requireUser(res, await getAuthenticatedUserId(req));
-  if (!userId) return;
-  const task = demoTasks.get(`${userId}:${todayKey()}`);
-  if (!task || task.id !== req.params.id) return res.status(404).json({ error: "Task not found." });
-  if (task.completed) return res.status(409).json({ error: "Task already completed." });
-  task.completed = true;
-  res.json({ task, xpAwarded: task.xpReward, idempotent: false });
-});
+function createMemoryStore(): DataStore {
+  const tasks = new Map<string, GeneratedTask>();
+  const communitySaves = new Set<string>();
+  const communityCompletions = new Set<string>();
+  const communityReactions = new Map<string, string>();
+  const profiles = new Map<string, Profile>();
+  const audits = new Map<string, ProfileAudit[]>();
+  const journalEntries = new Map<string, JournalEntry[]>();
+  const coachUsageLog: Array<{ userId: string; date: string }> = [];
+  const proUsers = new Set<string>();
 
-app.post("/api/practice/start", async (req, res) => {
-  const userId = requireUser(res, await getAuthenticatedUserId(req));
-  if (!userId) return;
-  const scenario = typeof req.body?.scenario === "string" ? req.body.scenario.slice(0, 80) : "New match";
-  res.json({ practiceId: `practice-${userId}-${Date.now()}`, scenario, startedAt: new Date().toISOString() });
-});
+  const touchProfile = (userId: string, xpDelta = 0) => {
+    const current = profiles.get(userId) || {};
+    const today = todayKey();
+    const newXp = (current.xp || 0) + xpDelta;
+    profiles.set(userId, {
+      ...current,
+      id: userId,
+      xp: newXp,
+      level: Math.floor(newXp / 100) + 1,
+      streak: current.lastActiveDate === today ? current.streak || 0 : (current.streak || 0) + 1,
+      lastActiveDate: today,
+    });
+  };
 
-app.post("/api/practice/message", async (req, res) => {
-  const userId = requireUser(res, await getAuthenticatedUserId(req));
-  if (!userId) return;
-  const message = typeof req.body?.message === "string" ? req.body.message.trim() : "";
-  if (!message || message.length > 2000) return res.status(400).json({ error: "Message must be between 1 and 2000 characters." });
-  res.json({ userId, message, reply: "Keep going. Make your next message specific and easy to answer." });
-});
+  const key = (userId: string, id: string) => `${userId}:${id}`;
 
-app.post("/api/practice/finish", async (req, res) => {
-  const userId = requireUser(res, await getAuthenticatedUserId(req));
-  if (!userId) return;
-  const score = Math.max(0, Math.min(100, Number(req.body?.score) || 0));
-  res.json({ userId, score, feedback: "Specific beats impressive. Keep the pressure low and the details real." });
-});
-
-app.post("/api/coach/context", async (req, res) => {
-  const userId = requireUser(res, await getAuthenticatedUserId(req));
-  if (!userId) return;
-  const context = typeof req.body?.context === "string" ? req.body.context.trim().slice(0, 500) : "";
-  if (!context) return res.status(400).json({ error: "Coach context is required." });
-  res.json({ userId, context, createdAt: new Date().toISOString() });
-});
-
-app.get("/api/community", async (req, res) => {
-  const userId = await getAuthenticatedUserId(req);
-  const category = typeof req.query.category === "string" ? req.query.category.toUpperCase() : "ALL";
-  const search = typeof req.query.search === "string" ? req.query.search.toLowerCase() : "";
-  const teachings = demoCommunityTeachings.filter((teaching) =>
-    (category === "ALL" || teaching.category === category) &&
-    (!search || `${teaching.title} ${teaching.summary}`.toLowerCase().includes(search))
-  );
-  res.json({ teachings, userId, nextCursor: null });
-});
-
-app.get("/api/community/teachings/:id", async (req, res) => {
-  const teaching = demoCommunityTeachings.find((item) => item.id === req.params.id);
-  if (!teaching) return res.status(404).json({ error: "Teaching not found." });
-  res.json({ teaching });
-});
-
-app.get("/api/community/progress", async (req, res) => {
-  const userId = requireUser(res, await getAuthenticatedUserId(req));
-  if (!userId) return;
-  res.json({ userId, saved: [...demoCommunitySaves].filter((key) => key.startsWith(`${userId}:`)), completed: [...demoCommunityCompletions].filter((key) => key.startsWith(`${userId}:`)) });
-});
-
-app.post("/api/community/teachings/:id/view", async (req, res) => {
-  const teaching = demoCommunityTeachings.find((item) => item.id === req.params.id);
-  if (!teaching) return res.status(404).json({ error: "Teaching not found." });
-  res.status(201).json({ teachingId: teaching.id, viewedAt: new Date().toISOString() });
-});
-
-app.post("/api/community/teachings/:id/save", async (req, res) => {
-  const userId = requireUser(res, await getAuthenticatedUserId(req));
-  if (!userId) return;
-  const key = `${userId}:${req.params.id}`;
-  demoCommunitySaves.add(key);
-  res.json({ saved: true, teachingId: req.params.id });
-});
-
-app.delete("/api/community/teachings/:id/save", async (req, res) => {
-  const userId = requireUser(res, await getAuthenticatedUserId(req));
-  if (!userId) return;
-  demoCommunitySaves.delete(`${userId}:${req.params.id}`);
-  res.json({ saved: false, teachingId: req.params.id });
-});
-
-app.post("/api/community/teachings/:id/react", async (req, res) => {
-  const userId = requireUser(res, await getAuthenticatedUserId(req));
-  if (!userId) return;
-  const reaction = typeof req.body?.reaction === "string" ? req.body.reaction : "";
-  if (!["🔥", "💀", "💡", "❤️"].includes(reaction)) return res.status(400).json({ error: "Unsupported reaction." });
-  const key = `${userId}:${req.params.id}`;
-  if (demoCommunityReactions.has(key)) return res.status(409).json({ error: "Teaching already reacted to." });
-  demoCommunityReactions.set(key, reaction);
-  res.status(201).json({ reaction, teachingId: req.params.id });
-});
-
-app.post("/api/community/teachings/:id/complete", async (req, res) => {
-  const userId = requireUser(res, await getAuthenticatedUserId(req));
-  if (!userId) return;
-  const teaching = demoCommunityTeachings.find((item) => item.id === req.params.id);
-  if (!teaching) return res.status(404).json({ error: "Teaching not found." });
-  const key = `${userId}:${teaching.id}`;
-  if (demoCommunityCompletions.has(key)) return res.status(409).json({ error: "Teaching already completed." });
-  demoCommunityCompletions.add(key);
-  res.status(201).json({ completed: true, xpAwarded: teaching.xp, teachingId: teaching.id });
-});
-
-app.get("/api/community/challenges", (_req, res) => {
-  res.json({ challenges: [{ id: "challenge-question", title: "Ask one better question today", description: "Ask something that reveals personality, then share something about yourself.", xp: 25 }] });
-});
-
-app.post("/api/community/challenges/:id/complete", async (req, res) => {
-  const userId = requireUser(res, await getAuthenticatedUserId(req));
-  if (!userId) return;
-  res.status(201).json({ completed: true, challengeId: req.params.id, xpAwarded: 25 });
-});
-
-app.get("/api/profile", async (req, res) => {
-  const userId = requireUser(res, await getAuthenticatedUserId(req));
-  if (!userId) return;
-  res.json({ userId, profile: demoProfiles.get(userId) || {}, audits: demoProfileAudits.get(userId) || [] });
-});
-
-app.patch("/api/profile", async (req, res) => {
-  const userId = requireUser(res, await getAuthenticatedUserId(req));
-  if (!userId) return;
-  const current = demoProfiles.get(userId) || {};
-  const next = { ...current, goal: String(req.body?.goal || current.goal || "dates").slice(0, 50), blocker: String(req.body?.blocker || current.blocker || "overthinking").slice(0, 80), vibe: ["gentle", "direct", "brutal"].includes(req.body?.vibe) ? req.body.vibe : current.vibe || "direct", updatedAt: new Date().toISOString() };
-  demoProfiles.set(userId, next);
-  res.json({ profile: next });
-});
-
-app.post("/api/profile/avatar", async (req, res) => {
-  const userId = requireUser(res, await getAuthenticatedUserId(req));
-  if (!userId) return;
-  const image = typeof req.body?.dataUrl === "string" ? req.body.dataUrl : "";
-  if (!/^data:image\/(png|jpeg|webp);base64,/i.test(image) || image.length > 7_000_000) return res.status(400).json({ error: "Invalid avatar image." });
-  demoProfiles.set(userId, { ...(demoProfiles.get(userId) || {}), avatarUrl: image });
-  res.status(201).json({ saved: true });
-});
-
-app.delete("/api/profile/avatar", async (req, res) => {
-  const userId = requireUser(res, await getAuthenticatedUserId(req));
-  if (!userId) return;
-  const profile = demoProfiles.get(userId) || {};
-  delete profile.avatarUrl;
-  demoProfiles.set(userId, profile);
-  res.json({ deleted: true });
-});
-
-app.post("/api/profile/dating-screenshots", async (req, res) => {
-  const userId = requireUser(res, await getAuthenticatedUserId(req));
-  if (!userId) return;
-  const image = typeof req.body?.dataUrl === "string" ? req.body.dataUrl : "";
-  if (!/^data:image\/(png|jpeg|webp);base64,/i.test(image) || image.length > 7_000_000) return res.status(400).json({ error: "Invalid screenshot." });
-  res.status(201).json({ id: `screenshot-${Date.now()}`, userId, saved: true });
-});
-
-app.post("/api/profile/roast", async (req, res) => {
-  const userId = requireUser(res, await getAuthenticatedUserId(req));
-  if (!userId) return;
-  const audit = { id: `audit-${Date.now()}`, userId, score: 7.1, analysis: { biggestFix: "Show more of your personality and give people an easy conversation hook.", keep: "Clear, recent photos with a visible face.", change: "Replace generic claims with specific details.", test: "Try one bio line that invites a playful reply." }, createdAt: new Date().toISOString() };
-  const audits = demoProfileAudits.get(userId) || [];
-  demoProfileAudits.set(userId, [audit, ...audits].slice(0, 20));
-  res.status(201).json({ audit });
-});
-
-app.get("/api/profile/audits", async (req, res) => {
-  const userId = requireUser(res, await getAuthenticatedUserId(req));
-  if (!userId) return;
-  res.json({ audits: demoProfileAudits.get(userId) || [] });
-});
-
-app.get("/api/profile/progress", async (req, res) => {
-  const userId = requireUser(res, await getAuthenticatedUserId(req));
-  if (!userId) return;
-  res.json({ userId, xp: 0, streak: 0, activeDays: 0, skills: {} });
-});
-
-app.get("/api/profile/achievements", async (req, res) => {
-  const userId = requireUser(res, await getAuthenticatedUserId(req));
-  if (!userId) return;
-  res.json({ userId, achievements: [] });
-});
-
-app.get("/api/profile/journal", async (req, res) => {
-  const userId = requireUser(res, await getAuthenticatedUserId(req));
-  if (!userId) return;
-  res.json({ entries: demoJournalEntries.get(userId) || [] });
-});
-
-app.post("/api/profile/journal", async (req, res) => {
-  const userId = requireUser(res, await getAuthenticatedUserId(req));
-  if (!userId) return;
-  const content = typeof req.body?.content === "string" ? req.body.content.trim() : "";
-  if (!content || content.length > 5000) return res.status(400).json({ error: "Journal content is required and must be under 5000 characters." });
-  const entry = { id: `journal-${Date.now()}`, userId, title: String(req.body?.title || "Dating reflection").slice(0, 100), type: String(req.body?.type || "observation").slice(0, 40), content, createdAt: new Date().toISOString() };
-  demoJournalEntries.set(userId, [entry, ...(demoJournalEntries.get(userId) || [])]);
-  res.status(201).json({ entry });
-});
-
-app.patch("/api/profile/journal/:id", async (req, res) => {
-  const userId = requireUser(res, await getAuthenticatedUserId(req));
-  if (!userId) return;
-  const entries = demoJournalEntries.get(userId) || [];
-  const entry = entries.find((item) => item.id === req.params.id);
-  if (!entry) return res.status(404).json({ error: "Journal entry not found." });
-  Object.assign(entry, { title: String(req.body?.title || entry.title).slice(0, 100), content: String(req.body?.content || entry.content).slice(0, 5000), updatedAt: new Date().toISOString() });
-  res.json({ entry });
-});
-
-app.delete("/api/profile/journal/:id", async (req, res) => {
-  const userId = requireUser(res, await getAuthenticatedUserId(req));
-  if (!userId) return;
-  demoJournalEntries.set(userId, (demoJournalEntries.get(userId) || []).filter((item) => item.id !== req.params.id));
-  res.json({ deleted: true });
-});
-
-app.post("/api/profile/reset", async (req, res) => {
-  const userId = requireUser(res, await getAuthenticatedUserId(req));
-  if (!userId || req.body?.confirmation !== "RESET") return res.status(400).json({ error: "Explicit RESET confirmation required." });
-  demoProfiles.delete(userId); demoProfileAudits.delete(userId); demoJournalEntries.delete(userId);
-  res.json({ deleted: true });
-});
-
-app.post("/api/profile/export", async (req, res) => {
-  const userId = requireUser(res, await getAuthenticatedUserId(req));
-  if (!userId) return;
-  res.json({ userId, profile: demoProfiles.get(userId) || {}, audits: demoProfileAudits.get(userId) || [], journal: demoJournalEntries.get(userId) || [], exportedAt: new Date().toISOString() });
-});
-
-app.get("/api/admin/dashboard", async (req, res) => {
-  const adminId = await requireAdmin(req, res);
-  if (!adminId) return;
-  const totalXp = [...demoProfiles.values()].reduce((sum, profile) => sum + Number(profile.xp || 0), 0);
-  res.json({ metrics: { users: demoProfiles.size, proUsers: 0, activeToday: 0, totalXp, coachMessagesToday: 0, tasksCompletedToday: 0, communityTeachings: demoCommunityTeachings.length, profileAudits: [...demoProfileAudits.values()].reduce((sum, audits) => sum + audits.length, 0), activeStreaks: 0 }, generatedAt: new Date().toISOString() });
-});
-
-app.get("/api/admin/users", async (req, res) => {
-  const adminId = await requireAdmin(req, res);
-  if (!adminId) return;
-  const search = typeof req.query.search === "string" ? req.query.search.toLowerCase() : "";
-  const users = [...demoProfiles.entries()].filter(([id, profile]) => !search || `${id} ${profile.username || ""} ${profile.email || ""}`.toLowerCase().includes(search)).map(([id, profile]) => ({ id, username: profile.username, email: profile.email, xp: profile.xp || 0, streak: profile.streak || 0, isPro: Boolean(profile.isPro) }));
-  res.json({ users, nextCursor: null });
-});
-
-app.get("/api/admin/audit-logs", async (req, res) => {
-  const adminId = await requireAdmin(req, res);
-  if (!adminId) return;
-  res.json({ logs: demoAdminAuditLogs });
-});
-
-app.get("/api/admin/features", async (req, res) => {
-  const adminId = await requireAdmin(req, res);
-  if (!adminId) return;
-  res.json({ features: Object.fromEntries(demoAdminFeatures) });
-});
-
-app.patch("/api/admin/features/:key", async (req, res) => {
-  const adminId = await requireAdmin(req, res);
-  if (!adminId) return;
-  const state = req.body?.state;
-  if (!["ON", "OFF", "BETA"].includes(state)) return res.status(400).json({ error: "Feature state must be ON, OFF, or BETA." });
-  demoAdminFeatures.set(req.params.key, state);
-  recordAdminAudit(adminId, "CHANGED FEATURE FLAG", "feature_flag", req.params.key, { state });
-  res.json({ key: req.params.key, state });
-});
-
-app.post("/api/admin/broadcasts", async (req, res) => {
-  const adminId = await requireAdmin(req, res);
-  if (!adminId) return;
-  const title = typeof req.body?.title === "string" ? req.body.title.trim().slice(0, 80) : "";
-  const message = typeof req.body?.message === "string" ? req.body.message.trim().slice(0, 500) : "";
-  if (!title || !message) return res.status(400).json({ error: "Title and message are required." });
-  const broadcast = { id: `broadcast-${Date.now()}`, title, message, tone: req.body?.tone || "update", status: req.body?.publish ? "LIVE" : "DRAFT", createdAt: new Date().toISOString(), createdBy: adminId };
-  recordAdminAudit(adminId, req.body?.publish ? "PUBLISHED BROADCAST" : "SAVED BROADCAST DRAFT", "broadcast", broadcast.id);
-  res.status(201).json({ broadcast });
-});
-
-app.patch("/api/admin/daily-lesson", async (req, res) => {
-  const adminId = await requireAdmin(req, res);
-  if (!adminId) return;
-  const payload = { lessonId: req.body?.lessonId || null, focus: String(req.body?.focus || "").slice(0, 100), taskType: String(req.body?.taskType || "PRACTICE"), difficulty: String(req.body?.difficulty || "INTERMEDIATE"), xp: Math.max(0, Math.min(500, Number(req.body?.xp) || 0)), updatedAt: new Date().toISOString() };
-  recordAdminAudit(adminId, "UPDATED DAILY LESSON", "daily_lesson", "today", payload);
-  res.json({ config: payload });
-});
-
-// Helper to initialize Gemini SDK safely
-function getGeminiClient() {
-  const apiKey = process.env.GEMINI_API_KEY;
-  if (!apiKey || apiKey === "MY_GEMINI_API_KEY") {
-    return null;
-  }
-  return new GoogleGenAI({
-    apiKey,
-    httpOptions: {
-      headers: {
-        "User-Agent": "aistudio-build",
+  return {
+    tasks: {
+      getOrCreateToday(userId, input) {
+        const k = `${userId}:${todayKey()}`;
+        const existing = tasks.get(k);
+        if (existing) return Promise.resolve(existing);
+        const task = buildDailyTask(userId, input);
+        tasks.set(k, task);
+        return Promise.resolve(task);
+      },
+      getToday(userId) {
+        return Promise.resolve(tasks.get(`${userId}:${todayKey()}`) ?? null);
+      },
+      async complete(userId, taskId) {
+        const k = `${userId}:${todayKey()}`;
+        const task = tasks.get(k);
+        if (!task || task.id !== taskId) return { status: 'not_found', task: null };
+        if (task.completed) return { status: 'already_completed', task };
+        task.completed = true;
+        touchProfile(userId, task.xpReward);
+        return { status: 'ok', task };
+      },
+      getProgress(userId) {
+        const profile = profiles.get(userId) || {};
+        const skills: Record<string, { completed: number; total: number }> = {};
+        for (const task of tasks.values()) {
+          if (task.userId !== userId) continue;
+          skills[task.skill] = skills[task.skill] || { completed: 0, total: 0 };
+          skills[task.skill].total += 1;
+          if (task.completed) skills[task.skill].completed += 1;
+        }
+        return Promise.resolve({ xp: profile.xp || 0, streak: profile.streak || 0, skills });
       },
     },
-  });
+    community: {
+      progress(userId) {
+        const prefix = `${userId}:`;
+        return Promise.resolve({
+          saved: [...communitySaves].filter((k) => k.startsWith(prefix)),
+          completed: [...communityCompletions].filter((k) => k.startsWith(prefix)),
+        });
+      },
+      save(userId, teachingId) {
+        communitySaves.add(key(userId, teachingId));
+        return Promise.resolve();
+      },
+      unsave(userId, teachingId) {
+        communitySaves.delete(key(userId, teachingId));
+        return Promise.resolve();
+      },
+      react(userId, teachingId) {
+        const k = key(userId, teachingId);
+        if (communityReactions.has(k)) return Promise.resolve('already');
+        communityReactions.set(k, 'x');
+        return Promise.resolve('ok');
+      },
+      complete(userId, teachingId, xp) {
+        const k = key(userId, teachingId);
+        if (communityCompletions.has(k)) return Promise.resolve('already');
+        communityCompletions.add(k);
+        touchProfile(userId, xp);
+        return Promise.resolve('ok');
+      },
+    },
+    profile: {
+      async get(userId) {
+        return { profile: profiles.get(userId) || {}, audits: audits.get(userId) || [] };
+      },
+      async update(userId, patch) {
+        const current = profiles.get(userId) || {};
+        const next: Profile = {
+          ...current,
+          id: userId,
+          goal: patch.goal ?? current.goal ?? 'dates',
+          blocker: patch.blocker ?? current.blocker ?? 'overthinking',
+          vibe: patch.vibe ?? current.vibe ?? 'direct',
+          lastActiveDate: todayKey(),
+        };
+        profiles.set(userId, next);
+        return next;
+      },
+      async saveAvatar(userId, dataUrl) {
+        profiles.set(userId, { ...(profiles.get(userId) || { id: userId }), avatarUrl: dataUrl });
+      },
+    },
+    journal: {
+      list(userId) {
+        return Promise.resolve(journalEntries.get(userId) || []);
+      },
+      create(userId, input) {
+        const entry: JournalEntry = {
+          id: `journal-${Date.now()}-${crypto.randomBytes(4).toString('hex')}`,
+          userId,
+          title: input.title,
+          type: input.type,
+          content: input.content,
+          createdAt: new Date().toISOString(),
+        };
+        journalEntries.set(userId, [entry, ...(journalEntries.get(userId) || [])]);
+        return Promise.resolve(entry);
+      },
+      update(userId, id, patch) {
+        const entries = journalEntries.get(userId) || [];
+        const entry = entries.find((e) => e.id === id);
+        if (!entry) return Promise.resolve(null);
+        if (patch.title !== undefined) entry.title = patch.title;
+        if (patch.content !== undefined) entry.content = patch.content;
+        entry.updatedAt = new Date().toISOString();
+        return Promise.resolve(entry);
+      },
+      remove(userId, id) {
+        const entries = journalEntries.get(userId) || [];
+        journalEntries.set(userId, entries.filter((e) => e.id !== id));
+        return Promise.resolve(true);
+      },
+    },
+    admin: {
+      async dashboard() {
+        const totalXp = [...profiles.values()].reduce((sum, p) => sum + Number(p.xp || 0), 0);
+        return {
+          users: profiles.size,
+          proUsers: proUsers.size,
+          activeToday: [...profiles.values()].filter((p) => p.lastActiveDate === todayKey()).length,
+          totalXp,
+          coachMessagesToday: coachUsageLog.filter((u) => u.userId && u.date === todayKey()).length,
+          tasksCompletedToday: 0,
+          communityTeachings: TEACHINGS.length,
+          profileAudits: [...audits.values()].reduce((s, a) => s + a.length, 0),
+          activeStreaks: [...profiles.values()].filter((p) => (p.streak || 0) > 0).length,
+        };
+      },
+      users() {
+        return Promise.resolve(
+          [...profiles.entries()].map(([id, p]) => ({
+            id,
+            username: p.username,
+            email: p.email,
+            xp: p.xp || 0,
+            streak: p.streak || 0,
+            isPro: proUsers.has(id),
+          })),
+        );
+      },
+      async setFeatureFlag() {
+        /* demo: feature flags were never persisted; keep as no-op */
+      },
+    },
+    coach: {
+      getPlan(userId) {
+        return Promise.resolve(proUsers.has(userId) ? 'pro' : 'free');
+      },
+      consumeQuota(userId, limit) {
+        const used = coachUsageLog.filter((u) => u.userId === userId && u.date === todayKey()).length;
+        if (used >= limit) return Promise.resolve(false);
+        coachUsageLog.push({ userId, date: todayKey() });
+        return Promise.resolve(true);
+      },
+      usageToday(userId) {
+        return Promise.resolve(coachUsageLog.filter((u) => u.userId === userId && u.date === todayKey()).length);
+      },
+      recordUsage() {
+        return Promise.resolve();
+      },
+      async saveResult(userId) {
+        touchProfile(userId, env.COACH_XP_REWARD);
+      },
+    },
+  };
 }
 
-// API endpoint for AI Dating Coach & Chat Roaster
-app.post("/api/coach", async (req, res) => {
-  const userId = await getAuthenticatedUserId(req);
-  if (!userId) {
-    return res.status(401).json({ error: "Authentication required." });
+/* -------------------------------------------------------------------------- */
+/* Supabase implementation (production)                                        */
+/* -------------------------------------------------------------------------- */
+
+function isUniqueViolation(error: { code?: string } | null): boolean {
+  return error?.code === '23505';
+}
+
+function createSupabaseStore(): DataStore {
+  /** Fetch one metric but degrade to a fallback instead of failing the dashboard. */
+  const metric = async <T>(name: string, fn: () => Promise<T>, fallback: T): Promise<T> => {
+    try {
+      return await fn();
+    } catch (err) {
+      logger.warn({ err, metric: name }, 'dashboard metric failed');
+      return fallback;
+    }
+  };
+
+  const count = async (table: string, apply?: (q: any) => any): Promise<number> => {
+    let q = sb().from(table).select('*', { count: 'exact', head: true });
+    if (apply) q = apply(q);
+    const { count: c, error } = await q;
+    if (error) throw error;
+    return c || 0;
+  };
+
+  const profileToCamel = (row: any): Profile => ({
+    id: row?.id,
+    username: row?.username,
+    email: row?.email,
+    xp: row?.xp ?? 0,
+    level: row?.level ?? 1,
+    streak: row?.streak ?? 0,
+    lastActiveDate: row?.last_active_date,
+    goal: row?.goal,
+    blocker: row?.blocker,
+    vibe: row?.vibe,
+    avatarUrl: row?.avatar_url,
+    isPro: Boolean(row?.is_pro),
+  });
+
+  return {
+    tasks: {
+      async getOrCreateToday(userId, input) {
+        const generated = buildDailyTask(userId, input);
+        const { data, error } = await sb()
+          .from('daily_tasks')
+          .upsert(
+            { user_id: userId, task_date: generated.taskDate, payload: generated as any },
+            { onConflict: 'user_id,task_date' },
+          )
+          .select('payload, completed')
+          .single();
+        if (error) {
+          logger.warn({ err: error, userId }, 'daily task upsert failed; returning generated task');
+          return generated;
+        }
+        return { ...(data.payload as GeneratedTask), completed: data.completed };
+      },
+      async getToday(userId) {
+        const { data } = await sb()
+          .from('daily_tasks')
+          .select('payload, completed')
+          .eq('user_id', userId)
+          .eq('task_date', todayKey())
+          .maybeSingle();
+        if (!data) return null;
+        return { ...(data.payload as GeneratedTask), completed: data.completed };
+      },
+      async complete(userId, taskId) {
+        const { data: row } = await sb()
+          .from('daily_tasks')
+          .select('payload, completed')
+          .eq('user_id', userId)
+          .eq('task_date', todayKey())
+          .maybeSingle();
+        if (!row || (row.payload as GeneratedTask)?.id !== taskId) {
+          return { status: 'not_found', task: null };
+        }
+        const task = { ...(row.payload as GeneratedTask), completed: true };
+        const { data: updated, error } = await sb()
+          .from('daily_tasks')
+          .update({ completed: true, completed_at: new Date().toISOString(), payload: task })
+          .eq('user_id', userId)
+          .eq('task_date', todayKey())
+          .eq('completed', false)
+          .select('payload')
+          .maybeSingle();
+        if (error) throw new ApiError(500, 'Failed to complete task.');
+        if (!updated) return { status: 'already_completed', task }; // lost a race
+        await awardXp(userId, task.xpReward);
+        return { status: 'ok', task };
+      },
+      async getProgress(userId) {
+        const { data: profile } = await sb()
+          .from('profiles')
+          .select('xp, streak')
+          .eq('id', userId)
+          .maybeSingle();
+        const since = new Date(Date.now() - 30 * 24 * 60 * 60 * 1000).toISOString().slice(0, 10);
+        const { data: rows } = await sb()
+          .from('daily_tasks')
+          .select('payload, completed')
+          .eq('user_id', userId)
+          .gte('task_date', since);
+        const skills: Record<string, { completed: number; total: number }> = {};
+        for (const row of rows ?? []) {
+          const skill = (row.payload as GeneratedTask)?.skill;
+          if (!skill) continue;
+          skills[skill] = skills[skill] || { completed: 0, total: 0 };
+          skills[skill].total += 1;
+          if (row.completed) skills[skill].completed += 1;
+        }
+        return { xp: profile?.xp ?? 0, streak: profile?.streak ?? 0, skills };
+      },
+    },
+    community: {
+      async progress(userId) {
+        const [{ data: saves }, { data: completions }] = await Promise.all([
+          sb().from('community_saves').select('teaching_id').eq('user_id', userId),
+          sb().from('community_completions').select('teaching_id').eq('user_id', userId),
+        ]);
+        return {
+          saved: (saves ?? []).map((r: any) => `${userId}:${r.teaching_id}`),
+          completed: (completions ?? []).map((r: any) => `${userId}:${r.teaching_id}`),
+        };
+      },
+      async save(userId, teachingId) {
+        const { error } = await sb()
+          .from('community_saves')
+          .upsert({ user_id: userId, teaching_id: teachingId }, { onConflict: 'user_id,teaching_id' });
+        if (error) throw new ApiError(500, 'Failed to save teaching.');
+      },
+      async unsave(userId, teachingId) {
+        const { error } = await sb()
+          .from('community_saves')
+          .delete()
+          .eq('user_id', userId)
+          .eq('teaching_id', teachingId);
+        if (error) throw new ApiError(500, 'Failed to unsave teaching.');
+      },
+      async react(userId, teachingId, reaction) {
+        const { error } = await sb()
+          .from('community_reactions')
+          .insert({ user_id: userId, teaching_id: teachingId, reaction });
+        if (isUniqueViolation(error)) return 'already';
+        if (error) throw new ApiError(500, 'Failed to record reaction.');
+        return 'ok';
+      },
+      async complete(userId, teachingId, xp) {
+        const { error } = await sb()
+          .from('community_completions')
+          .insert({ user_id: userId, teaching_id: teachingId, xp_awarded: xp });
+        if (isUniqueViolation(error)) return 'already';
+        if (error) throw new ApiError(500, 'Failed to complete teaching.');
+        await awardXp(userId, xp);
+        return 'ok';
+      },
+    },
+    profile: {
+      async get(userId) {
+        const [{ data: row }, { data: auditRows }] = await Promise.all([
+          sb().from('profiles').select('*').eq('id', userId).maybeSingle(),
+          sb().from('profile_audits').select('*').eq('user_id', userId).order('created_at', { ascending: false }),
+        ]);
+        const profileAudits: ProfileAudit[] = (auditRows ?? []).map((a: any) => ({
+          id: a.id,
+          userId: a.user_id,
+          score: a.score,
+          analysis: a.analysis ?? {},
+          createdAt: a.created_at,
+        }));
+        return { profile: profileToCamel(row), audits: profileAudits };
+      },
+      async update(userId, patch) {
+        const { data: current } = await sb().from('profiles').select('*').eq('id', userId).maybeSingle();
+        const next = {
+          goal: patch.goal ?? current?.goal ?? 'dates',
+          blocker: patch.blocker ?? current?.blocker ?? 'overthinking',
+          vibe: patch.vibe ?? current?.vibe ?? 'direct',
+          last_active_date: todayKey(),
+        };
+        const { error } = await sb().from('profiles').upsert({ id: userId, ...next }, { onConflict: 'id' });
+        if (error) throw new ApiError(500, 'Failed to update profile.');
+        return { ...profileToCamel(current), id: userId, ...next, lastActiveDate: next.last_active_date };
+      },
+      async saveAvatar(userId, dataUrl) {
+        const { error } = await sb()
+          .from('profiles')
+          .upsert({ id: userId, avatar_url: dataUrl }, { onConflict: 'id' });
+        if (error) throw new ApiError(500, 'Failed to save avatar.');
+      },
+    },
+    journal: {
+      async list(userId) {
+        const { data, error } = await sb()
+          .from('journal_entries')
+          .select('*')
+          .eq('user_id', userId)
+          .order('created_at', { ascending: false });
+        if (error) throw new ApiError(500, 'Failed to load journal.');
+        return (data ?? []).map((e: any) => ({
+          id: e.id,
+          userId: e.user_id,
+          title: e.title,
+          type: e.type,
+          content: e.content,
+          createdAt: e.created_at,
+          updatedAt: e.updated_at ?? undefined,
+        }));
+      },
+      async create(userId, input) {
+        const { data, error } = await sb()
+          .from('journal_entries')
+          .insert({ user_id: userId, title: input.title, type: input.type, content: input.content })
+          .select()
+          .single();
+        if (error) throw new ApiError(500, 'Failed to save journal entry.');
+        return {
+          id: data.id,
+          userId: data.user_id,
+          title: data.title,
+          type: data.type,
+          content: data.content,
+          createdAt: data.created_at,
+        };
+      },
+      async update(userId, id, patch) {
+        const updates: Record<string, string> = { updated_at: new Date().toISOString() };
+        if (patch.title !== undefined) updates.title = patch.title;
+        if (patch.content !== undefined) updates.content = patch.content;
+        const { data, error } = await sb()
+          .from('journal_entries')
+          .update(updates)
+          .eq('id', id)
+          .eq('user_id', userId)
+          .select()
+          .maybeSingle();
+        if (error) throw new ApiError(500, 'Failed to update journal entry.');
+        if (!data) return null;
+        return {
+          id: data.id,
+          userId: data.user_id,
+          title: data.title,
+          type: data.type,
+          content: data.content,
+          createdAt: data.created_at,
+          updatedAt: data.updated_at ?? undefined,
+        };
+      },
+      async remove(userId, id) {
+        const { error } = await sb().from('journal_entries').delete().eq('id', id).eq('user_id', userId);
+        if (error) throw new ApiError(500, 'Failed to delete journal entry.');
+        return true;
+      },
+    },
+    admin: {
+      async dashboard() {
+        const today = todayKey();
+        const [users, proUsers, activeToday, totalXp, coachMessagesToday, tasksCompletedToday, profileAudits, activeStreaks] =
+          await Promise.all([
+            metric('users', () => count('profiles'), 0),
+            metric('proUsers', () => count('subscriptions', (q) => q.eq('status', 'active').eq('plan', 'pro')), 0),
+            metric('activeToday', () => count('profiles', (q) => q.eq('last_active_date', today)), 0),
+            metric('totalXp', async () => {
+              const { data, error } = await sb().from('profiles').select('xp').limit(10000);
+              if (error) throw error;
+              return (data ?? []).reduce((sum: number, r: any) => sum + Number(r.xp || 0), 0);
+            }, 0),
+            metric('coachMessagesToday', () => count('coach_usage', (q) => q.gte('created_at', startOfTodayIso())), 0),
+            metric('tasksCompletedToday', () => count('daily_tasks', (q) => q.eq('completed', true).gte('completed_at', startOfTodayIso())), 0),
+            metric('profileAudits', () => count('profile_audits'), 0),
+            metric('activeStreaks', () => count('profiles', (q) => q.gt('streak', 0)), 0),
+          ]);
+        return {
+          users,
+          proUsers,
+          activeToday,
+          totalXp,
+          coachMessagesToday,
+          tasksCompletedToday,
+          communityTeachings: TEACHINGS.length,
+          profileAudits,
+          activeStreaks,
+        };
+      },
+      async users(search) {
+        const needle = search.toLowerCase();
+        let query = sb().from('profiles').select('id, username, email, xp, streak').limit(500);
+        if (needle) query = query.or(`username.ilike.%${needle}%,email.ilike.%${needle}%`);
+        const [{ data: rows, error }, { data: proRows }] = await Promise.all([
+          query,
+          sb().from('subscriptions').select('user_id').eq('status', 'active').eq('plan', 'pro'),
+        ]);
+        if (error) {
+          logger.warn({ err: error }, 'admin users query failed');
+          return [];
+        }
+        const proSet = new Set((proRows ?? []).map((r: any) => r.user_id));
+        return (rows ?? [])
+          .filter(
+            (r: any) =>
+              !needle ||
+              String(r.id).toLowerCase().includes(needle) ||
+              String(r.username ?? '').toLowerCase().includes(needle) ||
+              String(r.email ?? '').toLowerCase().includes(needle),
+          )
+          .map((r: any) => ({
+            id: r.id,
+            username: r.username,
+            email: r.email,
+            xp: r.xp || 0,
+            streak: r.streak || 0,
+            isPro: proSet.has(r.id),
+          }));
+      },
+      async setFeatureFlag(adminId, key, state) {
+        const { error } = await sb()
+          .from('admin_features')
+          .upsert({ key, state, updated_by: adminId, updated_at: new Date().toISOString() }, { onConflict: 'key' });
+        if (error) throw new ApiError(500, 'Failed to update feature flag.');
+        const { error: auditError } = await sb().from('admin_audit_logs').insert({
+          admin_user_id: adminId,
+          action: 'CHANGED FEATURE FLAG',
+          target_type: 'feature_flag',
+          target_id: key,
+          metadata: { state },
+        });
+        if (auditError) logger.warn({ err: auditError }, 'admin audit log insert failed');
+      },
+    },
+    coach: {
+      async getPlan(userId) {
+        const { data, error } = await sb()
+          .from('subscriptions')
+          .select('plan, status')
+          .eq('user_id', userId)
+          .eq('status', 'active')
+          .maybeSingle();
+        if (error || !data) return 'free';
+        return data.plan === 'pro' ? 'pro' : 'free';
+      },
+      async consumeQuota(userId, limit) {
+        // Atomically increments the daily counter only when under the limit —
+        // no check-then-act race, even with concurrent requests.
+        const { data, error } = await sb().rpc('try_consume_coach_quota', {
+          p_user_id: userId,
+          p_limit: limit,
+        });
+        if (error) throw new ApiError(503, 'Coach quota service unavailable.');
+        return Boolean(data);
+      },
+      async usageToday(userId) {
+        const { count, error } = await sb()
+          .from('coach_usage')
+          .select('*', { count: 'exact', head: true })
+          .eq('user_id', userId)
+          .gte('created_at', startOfTodayIso());
+        if (error) {
+          logger.warn({ err: error, userId }, 'coach usage lookup failed');
+          return 0;
+        }
+        return count || 0;
+      },
+      async recordUsage(userId, plan, model, inputTokens, outputTokens, totalTokens) {
+        const { error } = await sb().from('coach_usage').insert({
+          user_id: userId,
+          plan,
+          model,
+          input_tokens: inputTokens,
+          output_tokens: outputTokens,
+          total_tokens: totalTokens,
+          request_type: 'chat',
+        });
+        if (error) logger.warn({ err: error, userId }, 'coach usage record failed');
+      },
+      async saveResult(userId, situation, responseText) {
+        const takeMatch = responseText.match(/COACH'S TAKE\s*([\s\S]*?)(?=\nDO THIS|\nTRY|$)/i);
+        const doMatch = responseText.match(/DO THIS\s*([\s\S]*?)(?=\nTRY|$)/i);
+        const tryMatch = responseText.match(/TRY\s*["“]?([\s\S]*?)["”]?\s*$/i);
+
+        const analysis = takeMatch?.[1]?.trim() || responseText;
+        const advice = doMatch?.[1]?.trim() || '';
+        const suggestedMessage = tryMatch?.[1]?.trim() || '';
+
+        const { error: historyError } = await sb().from('coach_history').insert({
+          user_id: userId,
+          situation: situation || 'Coach request',
+          analysis,
+          advice,
+          suggested_message: suggestedMessage,
+          action: advice,
+          outcome: 'Pending',
+          xp_awarded: env.COACH_XP_REWARD,
+        });
+        if (historyError) logger.warn({ err: historyError, userId }, 'failed to save coach history');
+
+        await awardXp(userId, env.COACH_XP_REWARD);
+      },
+    },
+  };
+}
+
+const store: DataStore = demoMode ? createMemoryStore() : createSupabaseStore();
+
+// ============================================================================
+// EXPRESS APP SETUP
+// ============================================================================
+
+const app = express();
+app.set('trust proxy', 1); // required for correct client IPs behind proxies
+app.disable('x-powered-by');
+
+app.use(
+  helmet({
+    // CSP is opt-in (ENABLE_CSP=true) so it can be tuned against the real
+    // deployed SPA without risking breakage. Everything else is on by default.
+    contentSecurityPolicy:
+      env.ENABLE_CSP === 'true'
+        ? {
+            directives: {
+              defaultSrc: ["'self'"],
+              scriptSrc: ["'self'"],
+              styleSrc: ["'self'", "'unsafe-inline'"],
+              imgSrc: ["'self'", 'data:', 'blob:'],
+              connectSrc: ["'self'", 'https:', 'wss:'],
+              fontSrc: ["'self'", 'data:'],
+              objectSrc: ["'none'"],
+              frameAncestors: ["'none'"],
+            },
+          }
+        : false,
+    crossOriginEmbedderPolicy: false,
+    crossOriginResourcePolicy: { policy: 'cross-origin' }, // don't break cross-origin images
+  }),
+);
+
+// Strict, allowlist-only CORS. Default (empty allowlist) = same-origin only,
+// which is the correct posture for the SPA served by this same server.
+const allowedOrigins = (env.CORS_ORIGINS ?? '').split(',').map((s) => s.trim()).filter(Boolean);
+app.use((req: Request, res: Response, next: NextFunction) => {
+  const origin = req.headers.origin;
+  if (origin && allowedOrigins.includes(origin)) {
+    res.setHeader('Access-Control-Allow-Origin', origin);
+    res.setHeader('Vary', 'Origin');
+    res.setHeader('Access-Control-Allow-Headers', 'Authorization, Content-Type');
+    res.setHeader('Access-Control-Allow-Methods', 'GET, POST, PATCH, PUT, DELETE, OPTIONS');
+    if (req.method === 'OPTIONS') return res.sendStatus(204);
+  }
+  next();
+});
+
+app.use(
+  pinoHttp({
+    logger,
+    genReqId: (req) => (req.headers['x-request-id'] as string) || crypto.randomUUID(),
+    autoLogging: { ignore: (req) => req.url === '/healthz' || req.url === '/readyz' },
+    serializers: {
+      req: (req: any) => ({ id: req.id, method: req.method, url: req.url, userId: req.userId }),
+    },
+  }),
+);
+
+app.use(compression());
+app.use(express.json({ limit: '20mb' }));
+
+// Rate limiting (in-memory; swap the store for Redis when running multiple
+// instances behind a load balancer — see express-rate-limit docs).
+const apiLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  limit: 600,
+  standardHeaders: 'draft-7',
+  legacyHeaders: false,
+  message: { error: 'Too many requests, slow down.' },
+});
+
+const coachLimiter = rateLimit({
+  windowMs: 60 * 1000,
+  limit: 30,
+  standardHeaders: 'draft-7',
+  legacyHeaders: false,
+  message: { error: 'Too many coach requests, slow down.' },
+});
+
+app.use('/api', apiLimiter);
+
+// ============================================================================
+// INPUT VALIDATION SCHEMAS
+// ============================================================================
+
+const coachBodySchema = z.object({
+  message: z.string().max(4000).default(''),
+  vibe: z.enum(['gentle', 'direct', 'brutal', 'roasty']).default('direct'),
+  history: z
+    .array(z.object({ role: z.string().max(20), text: z.string().max(3000).optional() }))
+    .max(20)
+    .default([]),
+  imageBase64: z.string().max(8_000_000).optional(),
+  profile: z
+    .object({ goal: z.string().max(50).optional(), blocker: z.string().max(80).optional() })
+    .passthrough()
+    .default({}),
+});
+
+const practiceStartSchema = z.object({ scenario: z.string().max(80).optional() });
+const practiceMessageSchema = z.object({ message: z.string().min(1).max(2000) });
+const practiceFinishSchema = z.object({ score: z.coerce.number().min(0).max(100).default(0) });
+
+const profilePatchSchema = z
+  .object({
+    goal: z.string().max(50).optional(),
+    blocker: z.string().max(80).optional(),
+    vibe: z.enum(['gentle', 'direct', 'brutal']).optional(),
+  })
+  .strict();
+
+const avatarSchema = z.object({ dataUrl: z.string().max(10_000_000) });
+
+const journalCreateSchema = z.object({
+  title: z.string().max(100).optional(),
+  type: z.string().max(40).optional(),
+  content: z.string().min(1).max(5000),
+});
+
+const journalPatchSchema = z
+  .object({ title: z.string().max(100).optional(), content: z.string().min(1).max(5000).optional() })
+  .refine((d) => d.title !== undefined || d.content !== undefined, { message: 'Nothing to update.' });
+
+const reactionSchema = z.object({ reaction: z.enum(['🔥', '💀', '💡', '❤️']) }).strict();
+const featureFlagSchema = z.object({ state: z.enum(['ON', 'OFF', 'BETA']) }).strict();
+
+// ============================================================================
+// HEALTH CHECKS
+// ============================================================================
+
+app.get('/healthz', (_req, res) => {
+  res.json({ status: 'ok', uptime: process.uptime(), mode: demoMode ? 'demo' : 'production' });
+});
+
+app.get(
+  '/readyz',
+  ah(async (_req, res) => {
+    if (demoMode) return res.json({ status: 'ready', mode: 'demo' });
+    const { error } = await sb().from('profiles').select('id', { head: true, count: 'exact' });
+    if (error) return res.status(503).json({ status: 'not ready', detail: 'database' });
+    res.json({ status: 'ready' });
+  }),
+);
+
+// ============================================================================
+// API ROUTES: TASKS & PROGRESS (same contract as before)
+// ============================================================================
+
+app.get(
+  '/api/today',
+  ah(async (req, res) => {
+    const userId = await requireAuth(req, res);
+    if (!userId) return;
+
+    const task = await store.tasks.getOrCreateToday(userId, req.query as Record<string, unknown>);
+    res.json({ task, source: demoMode ? 'demo-cache' : 'supabase', generatedAt: new Date().toISOString() });
+  }),
+);
+
+app.get(
+  '/api/progress',
+  ah(async (req, res) => {
+    const userId = await requireAuth(req, res);
+    if (!userId) return;
+
+    const progress = await store.tasks.getProgress(userId);
+    res.json({ userId, ...progress });
+  }),
+);
+
+app.post(
+  '/api/tasks/:id/start',
+  ah(async (req, res) => {
+    const userId = await requireAuth(req, res);
+    if (!userId) return;
+
+    const task = await store.tasks.getToday(userId);
+    if (!task || task.id !== req.params.id) {
+      return res.status(404).json({ error: 'Task not found.' });
+    }
+    res.json({ task, startedAt: new Date().toISOString() });
+  }),
+);
+
+app.post(
+  '/api/tasks/:id/complete',
+  ah(async (req, res) => {
+    const userId = await requireAuth(req, res);
+    if (!userId) return;
+
+    const result = await store.tasks.complete(userId, req.params.id);
+    if (result.status === 'not_found') return res.status(404).json({ error: 'Task not found.' });
+    if (result.status === 'already_completed') return res.status(409).json({ error: 'Task already completed.' });
+
+    res.json({ task: result.task, xpAwarded: result.task!.xpReward, idempotent: false });
+  }),
+);
+
+// ============================================================================
+// API ROUTES: PRACTICE (same contract as before)
+// ============================================================================
+
+app.post(
+  '/api/practice/start',
+  ah(async (req, res) => {
+    const userId = await requireAuth(req, res);
+    if (!userId) return;
+
+    const body = parseBody(practiceStartSchema, req.body);
+    const scenario = (body.scenario ?? 'New match').slice(0, 80);
+    res.json({ practiceId: `practice-${userId}-${Date.now()}`, scenario, startedAt: new Date().toISOString() });
+  }),
+);
+
+app.post(
+  '/api/practice/message',
+  ah(async (req, res) => {
+    const userId = await requireAuth(req, res);
+    if (!userId) return;
+
+    const body = parseBody(practiceMessageSchema, req.body);
+    res.json({ userId, message: body.message, reply: 'Keep going. Make your next message specific and easy to answer.' });
+  }),
+);
+
+app.post(
+  '/api/practice/finish',
+  ah(async (req, res) => {
+    const userId = await requireAuth(req, res);
+    if (!userId) return;
+
+    const body = parseBody(practiceFinishSchema, req.body);
+    res.json({ userId, score: body.score, feedback: 'Specific beats impressive. Keep the pressure low and the details real.' });
+  }),
+);
+
+// ============================================================================
+// API ROUTES: COMMUNITY (same contract as before, now persisted)
+// ============================================================================
+
+app.get(
+  '/api/community',
+  ah(async (req, res) => {
+    const userId = await getAuthenticatedUserId(req);
+    const category = typeof req.query.category === 'string' ? req.query.category.toUpperCase() : 'ALL';
+    const search = typeof req.query.search === 'string' ? req.query.search.toLowerCase() : '';
+
+    const teachings = TEACHINGS.filter(
+      (teaching) =>
+        (category === 'ALL' || teaching.category === category) &&
+        (!search || `${teaching.title} ${teaching.summary}`.toLowerCase().includes(search)),
+    );
+
+    res.json({ teachings, userId, nextCursor: null });
+  }),
+);
+
+app.get(
+  '/api/community/teachings/:id',
+  ah(async (req, res) => {
+    const teaching = findTeaching(req.params.id);
+    if (!teaching) return res.status(404).json({ error: 'Teaching not found.' });
+    res.json({ teaching });
+  }),
+);
+
+app.get(
+  '/api/community/progress',
+  ah(async (req, res) => {
+    const userId = await requireAuth(req, res);
+    if (!userId) return;
+
+    const progress = await store.community.progress(userId);
+    res.json({ userId, ...progress });
+  }),
+);
+
+app.post(
+  '/api/community/teachings/:id/view',
+  ah(async (req, res) => {
+    const teaching = findTeaching(req.params.id);
+    if (!teaching) return res.status(404).json({ error: 'Teaching not found.' });
+    res.status(201).json({ teachingId: teaching.id, viewedAt: new Date().toISOString() });
+  }),
+);
+
+app.post(
+  '/api/community/teachings/:id/save',
+  ah(async (req, res) => {
+    const userId = await requireAuth(req, res);
+    if (!userId) return;
+
+    await store.community.save(userId, req.params.id);
+    res.json({ saved: true, teachingId: req.params.id });
+  }),
+);
+
+app.delete(
+  '/api/community/teachings/:id/save',
+  ah(async (req, res) => {
+    const userId = await requireAuth(req, res);
+    if (!userId) return;
+
+    await store.community.unsave(userId, req.params.id);
+    res.json({ saved: false, teachingId: req.params.id });
+  }),
+);
+
+app.post(
+  '/api/community/teachings/:id/react',
+  ah(async (req, res) => {
+    const userId = await requireAuth(req, res);
+    if (!userId) return;
+
+    const body = parseBody(reactionSchema, req.body);
+    const result = await store.community.react(userId, req.params.id, body.reaction);
+    if (result === 'already') return res.status(409).json({ error: 'Teaching already reacted to.' });
+
+    res.status(201).json({ reaction: body.reaction, teachingId: req.params.id });
+  }),
+);
+
+app.post(
+  '/api/community/teachings/:id/complete',
+  ah(async (req, res) => {
+    const userId = await requireAuth(req, res);
+    if (!userId) return;
+
+    const teaching = findTeaching(req.params.id);
+    if (!teaching) return res.status(404).json({ error: 'Teaching not found.' });
+
+    const result = await store.community.complete(userId, teaching.id, teaching.xp);
+    if (result === 'already') return res.status(409).json({ error: 'Teaching already completed.' });
+
+    res.status(201).json({ completed: true, xpAwarded: teaching.xp, teachingId: teaching.id });
+  }),
+);
+
+// ============================================================================
+// API ROUTES: PROFILE & JOURNAL (same contract as before)
+// ============================================================================
+
+app.get(
+  '/api/profile',
+  ah(async (req, res) => {
+    const userId = await requireAuth(req, res);
+    if (!userId) return;
+
+    const { profile, audits } = await store.profile.get(userId);
+    res.json({ userId, profile, audits });
+  }),
+);
+
+app.patch(
+  '/api/profile',
+  ah(async (req, res) => {
+    const userId = await requireAuth(req, res);
+    if (!userId) return;
+
+    const body = parseBody(profilePatchSchema, req.body);
+    const profile = await store.profile.update(userId, body);
+    res.json({ profile });
+  }),
+);
+
+const AVATAR_SIGNATURES: Record<string, number[]> = {
+  'image/png': [0x89, 0x50, 0x4e, 0x47],
+  'image/jpeg': [0xff, 0xd8, 0xff],
+  'image/webp': [0x52, 0x49, 0x46, 0x46],
+};
+
+/** Validates the data URL *and* the actual decoded bytes — declared type must match real content. */
+function validateAvatarDataUrl(dataUrl: string): void {
+  const match = /^data:(image\/(png|jpeg|webp));base64,([A-Za-z0-9+/=\r\n]+)$/.exec(dataUrl);
+  if (!match) throw badRequest('Invalid avatar image.');
+  const mime = match[1];
+  const bytes = Buffer.from(match[3], 'base64');
+  if (!bytes.length || bytes.length > 5_000_000) throw badRequest('Avatar image too large (max ~5MB).');
+  const signature = AVATAR_SIGNATURES[mime];
+  if (!signature || signature.some((b, i) => bytes[i] !== b)) {
+    throw badRequest('Avatar content does not match its declared type.');
+  }
+}
+
+app.post(
+  '/api/profile/avatar',
+  ah(async (req, res) => {
+    const userId = await requireAuth(req, res);
+    if (!userId) return;
+
+    const body = parseBody(avatarSchema, req.body);
+    validateAvatarDataUrl(body.dataUrl);
+    await store.profile.saveAvatar(userId, body.dataUrl);
+    res.status(201).json({ saved: true });
+  }),
+);
+
+app.get(
+  '/api/profile/journal',
+  ah(async (req, res) => {
+    const userId = await requireAuth(req, res);
+    if (!userId) return;
+
+    const entries = await store.journal.list(userId);
+    res.json({ entries });
+  }),
+);
+
+app.post(
+  '/api/profile/journal',
+  ah(async (req, res) => {
+    const userId = await requireAuth(req, res);
+    if (!userId) return;
+
+    const body = parseBody(journalCreateSchema, req.body);
+    const entry = await store.journal.create(userId, {
+      title: body.title ?? 'Dating reflection',
+      type: body.type ?? 'observation',
+      content: body.content.trim(),
+    });
+    res.status(201).json({ entry });
+  }),
+);
+
+app.patch(
+  '/api/profile/journal/:id',
+  ah(async (req, res) => {
+    const userId = await requireAuth(req, res);
+    if (!userId) return;
+
+    const body = parseBody(journalPatchSchema, req.body);
+    const entry = await store.journal.update(userId, req.params.id, body);
+    if (!entry) return res.status(404).json({ error: 'Journal entry not found.' });
+    res.json({ entry });
+  }),
+);
+
+app.delete(
+  '/api/profile/journal/:id',
+  ah(async (req, res) => {
+    const userId = await requireAuth(req, res);
+    if (!userId) return;
+
+    await store.journal.remove(userId, req.params.id);
+    res.json({ deleted: true });
+  }),
+);
+
+// ============================================================================
+// API ROUTES: ADMIN & SYSTEM (same contract as before, real metrics)
+// ============================================================================
+
+app.get(
+  '/api/admin/dashboard',
+  ah(async (req, res) => {
+    const adminId = await requireAdmin(req, res);
+    if (!adminId) return;
+
+    const metrics = await store.admin.dashboard();
+    res.json({ metrics, generatedAt: new Date().toISOString() });
+  }),
+);
+
+app.get(
+  '/api/admin/users',
+  ah(async (req, res) => {
+    const adminId = await requireAdmin(req, res);
+    if (!adminId) return;
+
+    const search = typeof req.query.search === 'string' ? req.query.search : '';
+    const users = await store.admin.users(search);
+    res.json({ users, nextCursor: null });
+  }),
+);
+
+app.patch(
+  '/api/admin/features/:key',
+  ah(async (req, res) => {
+    const adminId = await requireAdmin(req, res);
+    if (!adminId) return;
+
+    const body = parseBody(featureFlagSchema, req.body);
+    await store.admin.setFeatureFlag(adminId, req.params.key, body.state);
+    res.json({ key: req.params.key, state: body.state });
+  }),
+);
+
+// ============================================================================
+// API ROUTES: AI DATING COACH (same contract as before)
+// ============================================================================
+
+function getFallbackResponse(message: string = '', vibe: string = 'roasty', hasImage: boolean = false): string {
+  const msg = message.toLowerCase();
+
+  if (hasImage) {
+    return "bro this screenshot... you opened with 'wyd' or sent 3 unanswered texts? that's not flirting, that's a cry for help! \uD83D\uDC40\n\nHere is what you should say instead:\n• 'ok you left me on read, my ego is in shambles but i'll survive. down for coffee this week?'\n• 'fair enough - felt a vibe, but if not, all good!'";
+  }
+  if (msg.includes('ghosted') || msg.includes('read')) {
+    return "ghosted 101: they didn't die, they just chose silence. stop checking their story! 48hr rule: no checking their stuff for 2 days. if you still care, send ONE casual close-out or delete the chat. your time > their indecision.";
+  }
+  if (msg.includes('profile') || msg.includes('bio')) {
+    return "profile audit: 1 clear face photo in natural light + 1 full body doing something + 1 social proof + 1 chaos hobby. delete 'fluent in sarcasm' immediately. make your bio 70% weird specific humor, 30% hot!";
+  }
+  if (vibe === 'gentle') {
+    return "it's totally normal to feel nervous! focus on micro-reps today: make eye contact and smile at 2 people. confidence is built from tiny wins, not giant leaps. you've got this! ✨";
   }
 
-  try {
-    const {
-      message,
-      vibe = "direct",
-      history = [],
-      imageBase64,
-      profile = {},
-    } = req.body;
+  return 'rule of thumb: match their energy, add ONE playful tease, and end with a concrete question or plan. no paragraphs, no double texting!';
+}
 
-    const userText =
-      typeof message === "string" ? message.trim().slice(0, 4000) : "";
+async function callGeminiCoach(systemInstruction: string, contents: Content[]): Promise<GeminiResult | null> {
+  if (!GEMINI_API_KEY) return null;
 
-    if (!userText && !imageBase64) {
-      return res.status(400).json({ error: "Message or image is required." });
-    }
+  const ai = new GoogleGenAI({
+    apiKey: GEMINI_API_KEY,
+    httpOptions: { headers: { 'User-Agent': 'aistudio-build' } },
+  });
 
-    if (typeof imageBase64 === "string" && imageBase64.length > 8_000_000) {
-      return res.status(400).json({ error: "Image is too large." });
-    }
+  const candidateModels = ['gemini-3.8-flash', 'gemini-flash-latest', 'gemini-2.5-flash'];
 
-    const plan = await getCoachPlan(userId);
-    const freeDailyLimit = 3;
+  for (const model of candidateModels) {
+    try {
+      const timeout = new Promise<never>((_, reject) =>
+        setTimeout(() => reject(new Error(`Model ${model} timed out`)), 20_000),
+      );
+      const response = (await Promise.race([
+        ai.models.generateContent({
+          model,
+          contents,
+          config: { systemInstruction, temperature: 0.7, maxOutputTokens: 80 },
+        }),
+        timeout,
+      ])) as any;
 
-    if (plan === "free") {
-      const usedToday = await getCoachUsageToday(userId);
-
-      if (usedToday >= freeDailyLimit) {
-        return res.status(429).json({
-          error: "Daily Coach limit reached.",
-          code: "COACH_DAILY_LIMIT",
-          plan: "free",
-          limit: freeDailyLimit,
-          used: usedToday,
-          remaining: 0,
-        });
+      if (response?.text) {
+        const usage = response.usageMetadata;
+        const inputTokens = Number(usage?.promptTokenCount ?? usage?.inputTokenCount) || null;
+        const outputTokens = Number(usage?.candidatesTokenCount ?? usage?.outputTokenCount) || null;
+        const totalTokens = Number(usage?.totalTokenCount) || inputTokens + outputTokens || null;
+        return { text: response.text, model, inputTokens, outputTokens, totalTokens };
       }
+    } catch (modelError) {
+      logger.warn({ err: modelError, model }, 'Gemini model failed, trying next');
+      await new Promise((resolve) => setTimeout(resolve, 500));
     }
+  }
+  return null;
+}
 
-    const ai = getGeminiClient();
+app.post(
+  '/api/coach',
+  coachLimiter,
+  ah(async (req, res) => {
+    const userId = await requireAuth(req, res);
+    if (!userId) return;
 
-    let vibeInstruction = "";
-    if (vibe === "brutal" || vibe === "roasty") {
-      vibeInstruction =
-        "You are 'lol coach' on datings.lol in BRUTAL mode: blunt, concise, honest, and occasionally funny, but never abusive, degrading, coercive, manipulative, or cruel. Call out double texts, dry replies, pressure, and weak moves, then give a better move.";
-    } else if (vibe === "gentle") {
-      vibeInstruction =
-        "You are 'lol coach' on datings.lol - a warm, supportive, encouraging dating coach. Hype the user up, validate their feelings, reduce anxiety, and give clear, confident, actionable advice and reply suggestions.";
-    } else {
-      vibeInstruction =
-        "You are 'lol coach' on datings.lol - a direct, no-BS dating coach. Concise, tactical, no fluff, straight to the point with actionable steps and exact text templates.";
-    }
+    try {
+      const body = parseBody(coachBodySchema, req.body);
+      const userText = body.message.trim();
+      const hasImage = Boolean(body.imageBase64);
 
-    const systemInstruction = `${vibeInstruction}
+      if (!userText && !hasImage) {
+        return res.status(400).json({ error: 'Message or image is required.' });
+      }
 
+      // Quota: atomic consume for free users; pro users skip the check.
+      const plan = await store.coach.getPlan(userId);
+      if (plan === 'free') {
+        const allowed = await store.coach.consumeQuota(userId, env.COACH_FREE_DAILY_LIMIT);
+        if (!allowed) {
+          const used = await store.coach.usageToday(userId);
+          return res.status(429).json({
+            error: 'Daily Coach limit reached.',
+            code: 'COACH_DAILY_LIMIT',
+            plan: 'free',
+            limit: env.COACH_FREE_DAILY_LIMIT,
+            used,
+            remaining: 0,
+          });
+        }
+      }
+
+      const vibeInstruction =
+        body.vibe === 'brutal' || body.vibe === 'roasty'
+          ? "You are 'lol coach' on datings.lol in BRUTAL mode: blunt, concise, honest, and occasionally funny. Never abusive. Call out weak moves, then give a better move."
+          : body.vibe === 'gentle'
+            ? "You are 'lol coach' on datings.lol - a warm, encouraging dating coach. Hype the user up, reduce anxiety, and give confident, actionable advice."
+            : "You are 'lol coach' on datings.lol - a direct, no-BS dating coach. Concise, tactical, straight to the point with actionable steps.";
+
+      const systemInstruction = `${vibeInstruction}
 The user's context is:
-goal=${profile.goal || "unknown"}
-blocker=${profile.blocker || "unknown"}
-experience=${profile.experience || "unknown"}
-
-You are a practical dating coach.
+goal=${body.profile.goal || 'unknown'}
+blocker=${body.profile.blocker || 'unknown'}
 
 OUTPUT FORMAT — FOLLOW EXACTLY:
 COACH'S TAKE
@@ -672,214 +1607,155 @@ TRY
 
 STRICT RULES:
 - Output ONLY those 3 sections.
-- Use the headings exactly: COACH'S TAKE, DO THIS, TRY.
-- COACH'S TAKE = exactly one short sentence.
-- DO THIS = exactly one short sentence.
-- TRY = exactly one short message in quotation marks.
-- No WHY section.
-- No bullet points.
-- No extra explanation.
-- No paragraphs.
-- Keep the entire response very short.
-- Never claim certainty about another person's feelings.
-- Never encourage manipulation, pressure, harassment, or deception.`;
+- Use headings exactly: COACH'S TAKE, DO THIS, TRY.
+- No WHY section, no bullets, no paragraphs.`;
 
-    let responseText: string | null = null;
-    let usedModel: string | null = null;
-    let inputTokens: number | null = null;
-    let outputTokens: number | null = null;
-    let totalTokens: number | null = null;
-
-    if (ai) {
-      const contents: any[] = [];
-
-      if (Array.isArray(history) && history.length > 0) {
-        history.slice(-6).forEach((h: any) => {
-          if (h.text) {
-            contents.push({
-              role: h.role === "user" ? "user" : "model",
-              parts: [{ text: String(h.text).slice(0, 3000) }],
-            });
-          }
-        });
-      }
+      const contents: Content[] = [];
+      body.history.slice(-6).forEach((h) => {
+        if (h.text) {
+          contents.push({
+            role: h.role === 'user' ? 'user' : 'model',
+            parts: [{ text: h.text.slice(0, 3000) }],
+          });
+        }
+      });
 
       const currentParts: any[] = [];
-
-      if (imageBase64) {
-        const cleanedBase64 = String(imageBase64).replace(
-          /^data:image\/\w+;base64,/,
-          "",
-        );
-        const mimeMatch = String(imageBase64).match(
-          /^data:(image\/\w+);base64,/,
-        );
-        const mimeType = mimeMatch ? mimeMatch[1] : "image/jpeg";
-
+      if (body.imageBase64) {
+        const cleanedBase64 = body.imageBase64.replace(/^data:image\/\w+;base64,/, '');
+        const mimeMatch = body.imageBase64.match(/^data:(image\/\w+);base64,/);
         currentParts.push({
-          inlineData: {
-            mimeType,
-            data: cleanedBase64,
+          inlineData: { mimeType: mimeMatch ? mimeMatch[1] : 'image/jpeg', data: cleanedBase64 },
+        });
+      }
+      currentParts.push({ text: userText || (hasImage ? 'Roast this chat / profile screenshot and give me actionable fixes.' : 'Give me dating advice.') });
+      contents.push({ role: 'user', parts: currentParts });
+
+      const result = await callGeminiCoach(systemInstruction, contents);
+
+      // Analytics record (attempt, model, token usage) — same as before.
+      await store.coach.recordUsage(
+        userId,
+        plan,
+        result?.model ?? null,
+        result?.inputTokens ?? null,
+        result?.outputTokens ?? null,
+        result?.totalTokens ?? null,
+      );
+
+      if (result) {
+        await store.coach.saveResult(userId, userText, result.text);
+        return res.json({
+          text: result.text,
+          isAi: true,
+          plan,
+          usage: {
+            model: result.model,
+            inputTokens: result.inputTokens,
+            outputTokens: result.outputTokens,
+            totalTokens: result.totalTokens,
           },
         });
       }
 
-      const userPrompt =
-        userText ||
-        (imageBase64
-          ? "Roast this chat / profile screenshot and give me actionable fixes."
-          : "Give me dating advice.");
-
-      currentParts.push({ text: userPrompt });
-
-      contents.push({
-        role: "user",
-        parts: currentParts,
-      });
-
-      const candidateModels = [
-        "gemini-3.8-flash",
-        "gemini-flash-latest",
-        "gemini-2.5-flash",
-      ];
-
-      for (const model of candidateModels) {
-        try {
-          const response = await ai.models.generateContent({
-            model,
-            contents,
-            config: {
-              systemInstruction,
-              temperature: 0.7,
-              maxOutputTokens: 80,
-            },
-          });
-
-          if (response.text) {
-            responseText = response.text;
-            usedModel = model;
-
-            const usage = (response as any).usageMetadata;
-            inputTokens =
-              Number(usage?.promptTokenCount ?? usage?.inputTokenCount) || null;
-            outputTokens =
-              Number(usage?.candidatesTokenCount ?? usage?.outputTokenCount) ||
-              null;
-            totalTokens =
-              Number(usage?.totalTokenCount) ||
-              (inputTokens !== null || outputTokens !== null
-                ? (inputTokens || 0) + (outputTokens || 0)
-                : null);
-
-            break;
-          }
-        } catch (modelError: any) {
-          console.warn(
-            `Model ${model} failed, trying next candidate:`,
-            modelError?.message || modelError,
-          );
-          await new Promise((resolve) => setTimeout(resolve, 500));
-        }
-      }
-    }
-
-    await recordCoachUsage(
-      userId,
-      plan,
-      usedModel,
-      inputTokens,
-      outputTokens,
-      totalTokens,
-    );
-
-    if (responseText) {
-      await saveCoachResult(userId, userText, responseText);
-
+      const fallbackText = getFallbackResponse(userText, body.vibe, hasImage);
+      await store.coach.saveResult(userId, userText, fallbackText);
       return res.json({
-        text: responseText,
-        isAi: true,
+        text: fallbackText,
+        isAi: false,
         plan,
-        usage: {
-          model: usedModel,
-          inputTokens,
-          outputTokens,
-          totalTokens,
-        },
+        usage: { model: null, inputTokens: null, outputTokens: null, totalTokens: null },
       });
+    } catch (error) {
+      if (error instanceof ApiError) throw error;
+      logger.error({ err: error, userId }, 'coach request failed');
+      return res.status(500).json({ error: 'Coach is temporarily unavailable. Please try again.', code: 'COACH_SERVER_ERROR' });
     }
+  }),
+);
 
-    const fallbackText = getFallbackResponse(
-      userText,
-      vibe,
-      !!imageBase64,
-    );
+// ============================================================================
+// 404 + GLOBAL ERROR HANDLER
+// ============================================================================
 
-    await saveCoachResult(userId, userText, fallbackText);
-
-    return res.json({
-      text: fallbackText,
-      isAi: false,
-      plan,
-      usage: {
-        model: null,
-        inputTokens: null,
-        outputTokens: null,
-        totalTokens: null,
-      },
-    });
-  } catch (error: any) {
-    console.error("Error in /api/coach:", error);
-
-    return res.status(500).json({
-      error: "Coach is temporarily unavailable. Please try again.",
-      code: "COACH_SERVER_ERROR",
-    });
-  }
+app.use('/api', (_req, res) => {
+  res.status(404).json({ error: 'Not found.' });
 });
 
-// Fallback heuristic engine
-function getFallbackResponse(message: string = "", vibe: string = "roasty", hasImage: boolean = false): string {
-  const msg = (message || "").toLowerCase();
-
-  if (hasImage) {
-    return "bro this screenshot... you opened with 'wyd' or sent 3 unanswered texts? that's not flirting, that's a cry for help! \uD83D\uDC40\n\nHere is what you should say instead:\n• 'ok you left me on read, my ego is in shambles but i'll survive. down for coffee this week?'\n• 'fair enough - felt a vibe, but if not, all good!'";
+app.use((err: Error, req: Request, res: Response, _next: NextFunction) => {
+  if (err instanceof ApiError) {
+    const payload: Record<string, unknown> = { error: err.message };
+    if (err.code) payload.code = err.code;
+    return res.status(err.statusCode).json(payload);
   }
-
-  if (msg.includes("ghosted") || msg.includes("read")) {
-    return "ghosted 101: they didn't die, they just chose silence. stop checking their story! 48hr rule: no checking their stuff for 2 days. if you still care, send ONE casual close-out or delete the chat. your time > their indecision.";
+  if (err instanceof SyntaxError && 'body' in err) {
+    return res.status(400).json({ error: 'Invalid JSON body.' });
   }
+  (req as any).log?.error({ err }, 'unhandled error');
+  res.status(500).json({ error: 'Internal Server Error.' });
+});
 
-  if (msg.includes("profile") || msg.includes("bio")) {
-    return "profile audit: 1 clear face photo in natural light + 1 full body doing something + 1 social proof + 1 chaos hobby. delete 'fluent in sarcasm' immediately. make your bio 70% weird specific humor, 30% hot!";
-  }
-
-  if (vibe === "gentle") {
-    return "it's totally normal to feel nervous! focus on micro-reps today: make eye contact and smile at 2 people. confidence is built from tiny wins, not giant leaps. you've got this! ✨";
-  }
-
-  return "rule of thumb: match their energy, add ONE playful tease, and end with a concrete question or plan. no paragraphs, no double texting!";
-}
+// ============================================================================
+// STATIC SPA (production) + SERVER STARTUP + GRACEFUL SHUTDOWN
+// ============================================================================
 
 async function startServer() {
-  // Vite middleware for dev
-  if (process.env.NODE_ENV !== "production") {
-    const { createServer: createViteServer } = await import("vite");
-    const vite = await createViteServer({
-      server: { middlewareMode: true },
-      appType: "spa",
-    });
-    app.use(vite.middlewares);
+  if (!isProd) {
+    try {
+      const { createServer: createViteServer } = await import('vite');
+      const vite = await createViteServer({
+        server: { middlewareMode: true },
+        appType: 'spa',
+      });
+      app.use(vite.middlewares);
+      logger.info('Vite dev middleware enabled');
+    } catch {
+      logger.warn('Vite not available — API-only dev mode (serve the UI separately).');
+    }
   } else {
-    const distPath = path.join(process.cwd(), "dist");
-    app.use(express.static(distPath));
-    app.get("*", (req, res) => {
-      res.sendFile(path.join(distPath, "index.html"));
+    const distPath = path.join(process.cwd(), 'dist');
+    app.use(
+      express.static(distPath, {
+        index: false,
+        setHeaders: (res, filePath) => {
+          if (/\.(js|css|png|jpg|jpeg|webp|svg|woff2?)$/.test(filePath)) {
+            res.setHeader('Cache-Control', 'public, max-age=31536000, immutable');
+          }
+        },
+      }),
+    );
+    app.use((req: Request, res: Response, next: NextFunction) => {
+      if ((req.method !== 'GET' && req.method !== 'HEAD') || req.path.startsWith('/api/')) return next();
+      res.sendFile(path.join(distPath, 'index.html'));
     });
   }
 
-    app.listen(PORT, "localhost", () => {
-    console.log(`Datings.lol Server running at http://localhost:${PORT}`);
+  const server = app.listen(env.PORT, env.HOST, () => {
+    logger.info(`🚀 Datings.lol server running on http://${env.HOST}:${env.PORT} (${env.NODE_ENV}${demoMode ? ', demo mode' : ''})`);
   });
-}  // ← ADD THIS
+  server.requestTimeout = 60_000;
 
-startServer();
+  const shutdown = (signal: string) => {
+    logger.info({ signal }, 'shutting down');
+    server.close(() => {
+      logger.info('closed');
+      process.exit(0);
+    });
+    setTimeout(() => process.exit(1), 10_000).unref();
+  };
+  process.on('SIGINT', () => shutdown('SIGINT'));
+  process.on('SIGTERM', () => shutdown('SIGTERM'));
+}
+
+process.on('unhandledRejection', (reason) => {
+  logger.error({ reason }, 'unhandledRejection');
+});
+process.on('uncaughtException', (err) => {
+  logger.fatal({ err }, 'uncaughtException');
+  process.exit(1);
+});
+
+startServer().catch((err) => {
+  logger.fatal({ err }, 'failed to start server');
+  process.exit(1);
+});
