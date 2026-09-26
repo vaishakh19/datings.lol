@@ -1,9 +1,6 @@
-import { AdminSettings, AuthUser } from "../types";
+import { AdminSettings } from "../types";
 
 const ADMIN_SETTINGS_KEY = "datings_admin_settings";
-
-const ADMIN_USERNAMES = ["vaishakh19", "admin"];
-const ADMIN_EMAILS = ["vaishakhdesktop@gmail.com", "admin@datings.lol"];
 
 export const DEFAULT_ADMIN_SETTINGS: AdminSettings = {
   notifications: [],
@@ -15,13 +12,6 @@ export const DEFAULT_ADMIN_SETTINGS: AdminSettings = {
     updatedAt: new Date(0).toISOString(),
   },
 };
-
-export function isAdminUser(user: AuthUser | null): boolean {
-  if (!user) return false;
-  const username = user.username.trim().toLowerCase();
-  const email = user.email.trim().toLowerCase();
-  return ADMIN_USERNAMES.includes(username) || ADMIN_EMAILS.includes(email);
-}
 
 export function getAdminSettings(): AdminSettings {
   try {

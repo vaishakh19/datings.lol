@@ -21,7 +21,6 @@ import { TodayTab } from "./components/TodayTab";
 import { CoachTab } from "./components/CoachTab";
 import { ProfileTab } from "./components/ProfileTab";
 import { SupportTab } from "./components/SupportTab";
-import { AdminTab } from "./components/AdminTab";
 import { CommunityTab } from "./components/CommunityTab";
 import { ProModal } from "./components/ProModal";
 import { HotTakeModal } from "./components/HotTakeModal";
@@ -48,11 +47,18 @@ import {
 import {
   getActiveAdminNotification,
   getAdminSettings,
-  isAdminUser,
   saveAdminSettings,
 } from "./utils/adminStorage";
+import { loadPublicAdminSettings, verifyAdminSession } from "./lib/adminApi";
+import { loadAccountEntitlements } from "./lib/api";
 
 const MAX_FREE_CHATS = 3;
+
+// The operations workspace is intentionally split from the member app; its
+// dense tables and controls should not increase the initial customer bundle.
+const AdminTab = React.lazy(() =>
+  import("./components/AdminTab").then((module) => ({ default: module.AdminTab })),
+);
 
 function getTodayStr(): string {
   return new Date().toLocaleDateString("en-CA");
@@ -97,6 +103,7 @@ export default function App() {
     return "today";
   });
   const [adminSettings, setAdminSettings] = useState<AdminSettings>(() => getAdminSettings());
+  const [adminAccess, setAdminAccess] = useState<"checking" | "allowed" | "denied">("checking");
   const [dismissedNotificationIds, setDismissedNotificationIds] = useState<string[]>([]);
   const [messages, setMessages] = useState<ChatMessage[]>(
     () => createDefaultUserAppState().messages,
@@ -121,6 +128,7 @@ export default function App() {
   );
   const [syncError, setSyncError] = useState("");
   const hydratedUserIdRef = useRef<string | null>(null);
+  const entitlementsLoadedForRef = useRef<string | null>(null);
   const latestStateRef = useRef<UserAppState>(createDefaultUserAppState());
   const saveTimerRef = useRef<number | null>(null);
   const saveQueueRef = useRef<Promise<void>>(Promise.resolve());
@@ -169,6 +177,46 @@ export default function App() {
     };
   }, []);
 
+  // Published operations settings come from the server so broadcasts and daily
+  // programming are consistent across devices. localStorage remains only a
+  // fast fallback for a temporarily offline session.
+  useEffect(() => {
+    if (authLoading) return;
+    let cancelled = false;
+    void loadPublicAdminSettings()
+      .then((settings) => {
+        if (!settings || cancelled) return;
+        saveAdminSettings(settings);
+        setAdminSettings(settings);
+      })
+      .catch(() => undefined);
+    return () => {
+      cancelled = true;
+    };
+  }, [authLoading, supabaseUser?.id]);
+
+  // Admin visibility is derived from the same server-side authorization used
+  // by every admin API route; user-editable profile metadata is never trusted.
+  useEffect(() => {
+    if (authLoading) return;
+    if (!supabaseUser) {
+      setAdminAccess("denied");
+      return;
+    }
+    let cancelled = false;
+    setAdminAccess("checking");
+    void verifyAdminSession()
+      .then(() => {
+        if (!cancelled) setAdminAccess("allowed");
+      })
+      .catch(() => {
+        if (!cancelled) setAdminAccess("denied");
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [authLoading, supabaseUser?.id]);
+
   const applyUserState = (state: UserAppState) => {
     const today = getTodayStr();
     const nextState = {
@@ -213,6 +261,7 @@ export default function App() {
     const userId = supabaseUser?.id;
     if (!userId) {
       hydratedUserIdRef.current = null;
+      entitlementsLoadedForRef.current = null;
       setSyncStatus("loading");
       return;
     }
@@ -262,6 +311,31 @@ export default function App() {
       cancelled = true;
     };
   }, [supabaseUser?.id]);
+
+  // Paid access is an account entitlement, not a client preference. Reconcile
+  // the synchronized UI payload with the authoritative subscriptions table
+  // after hydration so admin plan changes take effect on every device.
+  useEffect(() => {
+    const userId = supabaseUser?.id;
+    if (
+      !userId ||
+      syncStatus === "loading" ||
+      hydratedUserIdRef.current !== userId ||
+      entitlementsLoadedForRef.current === userId
+    ) {
+      return;
+    }
+    entitlementsLoadedForRef.current = userId;
+    void loadAccountEntitlements()
+      .then((entitlements) => {
+        if (entitlements && hydratedUserIdRef.current === userId) {
+          setIsPro(entitlements.isPro);
+        }
+      })
+      .catch(() => {
+        entitlementsLoadedForRef.current = null;
+      });
+  }, [supabaseUser?.id, syncStatus]);
 
   // Keep a fast per-user cache and debounce writes into one ordered Supabase
   // upsert. Ordering prevents an older request from overwriting a newer state.
@@ -387,7 +461,7 @@ export default function App() {
     return () => window.clearTimeout(timer);
   }, [lastHotTakeDate, profile, syncStatus]);
 
-  const adminAllowed = isAdminUser(currentUser);
+  const adminAllowed = adminAccess === "allowed";
 
   useEffect(() => {
     const handleRouteChange = () => {
@@ -429,13 +503,14 @@ export default function App() {
   }, [authLoading, supabaseUser, isGuest, pathname]);
 
   useEffect(() => {
-    if (activeTab === "admin" && !adminAllowed) {
+    if (activeTab === "admin" && adminAccess === "denied") {
       if (window.location.pathname === "/admin") {
-        window.history.replaceState({}, "", "/");
+        window.history.replaceState({}, "", "/dashboard");
+        setPathname("/dashboard");
       }
       setActiveTab("today");
     }
-  }, [activeTab, adminAllowed]);
+  }, [activeTab, adminAccess]);
 
   const handleSelectTab = (tab: AppTab) => {
     setActiveTab(tab);
@@ -824,8 +899,10 @@ export default function App() {
     return <Onboarding onComplete={handleOnboardingComplete} />;
   }
 
+  const inAdminWorkspace = activeTab === "admin";
+
   return (
-    <div className="min-h-screen bg-[#FFFBEB] text-[#111] font-sans selection:bg-[#FFE066] relative overflow-x-hidden">
+    <div className={`min-h-screen text-[#111] font-sans selection:bg-[#FFE066] relative overflow-x-hidden ${inAdminWorkspace ? "bg-[#F4F5EF]" : "bg-[#FFFBEB]"}`}>
       {/* Confetti Overlay */}
       {showConfetti && (
         <div className="fixed inset-0 pointer-events-none z-[100] overflow-hidden">
@@ -861,7 +938,7 @@ export default function App() {
       )}
 
       {/* Daily Hot Take Modal */}
-      {showHotTakeModal && (
+      {showHotTakeModal && !inAdminWorkspace && (
         <HotTakeModal
           hotTake={todayHotTake}
           onVote={handleVoteHotTake}
@@ -888,20 +965,22 @@ export default function App() {
         </div>
       )}
 
-      {/* Top Header */}
-      <Header
-        progress={progress}
-        avatarUrl={avatarUrl}
-            onOpenProfile={() => handleSelectTab("profile")}
-        currentUser={currentUser}
-        onSignOut={handleSignOut}
-        onOpenAuth={handleOpenAuth}
-        isBouncingStreak={isBouncingStreak}
-      />
+      {/* The admin workspace has its own dedicated application chrome. */}
+      {!inAdminWorkspace && (
+        <Header
+          progress={progress}
+          avatarUrl={avatarUrl}
+          onOpenProfile={() => handleSelectTab("profile")}
+          currentUser={currentUser}
+          onSignOut={handleSignOut}
+          onOpenAuth={handleOpenAuth}
+          isBouncingStreak={isBouncingStreak}
+        />
+      )}
 
       {/* Main Tab Content */}
-      <main className="max-w-[640px] mx-auto px-4 pb-[100px] pt-6">
-        {syncStatus === "offline" && (
+      <main className={inAdminWorkspace ? "w-full min-h-screen" : "max-w-[640px] mx-auto px-4 pb-[100px] pt-6"}>
+        {!inAdminWorkspace && syncStatus === "offline" && (
           <div className="mb-5 bg-[#FDA4AF] border-[3px] border-black rounded-[18px] p-3 brutal-shadow-sm">
             <div className="font-black text-[12px] uppercase">Cloud sync paused</div>
             <p className="font-bold text-[11px] mt-1">
@@ -911,7 +990,7 @@ export default function App() {
           </div>
         )}
 
-        {shouldShowAdminNotification && activeAdminNotification && (
+        {!inAdminWorkspace && shouldShowAdminNotification && activeAdminNotification && (
           <div className="mb-5 bg-white border-[3px] border-black rounded-[20px] p-4 brutal-shadow-sm animate-[pop_0.25s_ease-out]">
             <div className="flex items-start justify-between gap-3">
               <div className="flex items-start gap-3">
@@ -1037,20 +1116,41 @@ export default function App() {
           />
         )}
 
+        {activeTab === "admin" && adminAccess === "checking" && (
+          <div className="min-h-screen bg-[#F4F5EF] flex flex-col items-center justify-center gap-3">
+            <div className="w-10 h-10 rounded-full border-[3px] border-black/15 border-t-black animate-spin" />
+            <div className="text-[11px] font-black uppercase tracking-[0.16em] text-black/45">Verifying admin access</div>
+          </div>
+        )}
+
         {activeTab === "admin" && adminAllowed && (
-          <AdminTab
-            settings={adminSettings}
-            onSaveSettings={handleSaveAdminSettings}
-          />
+          <React.Suspense
+            fallback={
+              <div className="min-h-screen bg-[#F4F5EF] flex flex-col items-center justify-center gap-3">
+                <div className="w-10 h-10 rounded-full border-[3px] border-black/15 border-t-black animate-spin" />
+                <div className="text-[11px] font-black uppercase tracking-[0.16em] text-black/45">Loading command center</div>
+              </div>
+            }
+          >
+            <AdminTab
+              settings={adminSettings}
+              onSaveSettings={handleSaveAdminSettings}
+              currentUser={currentUser}
+              onExit={() => handleSelectTab("today")}
+              onSignOut={() => void handleSignOut()}
+            />
+          </React.Suspense>
         )}
       </main>
 
       {/* Bottom Navigation */}
-      <Navigation
-        activeTab={activeTab}
-        onSelectTab={handleSelectTab}
-        showAdmin={adminAllowed && window.location.pathname === "/admin"}
-      />
+      {!inAdminWorkspace && (
+        <Navigation
+          activeTab={activeTab}
+          onSelectTab={handleSelectTab}
+          showAdmin={false}
+        />
+      )}
     </div>
   );
 }
