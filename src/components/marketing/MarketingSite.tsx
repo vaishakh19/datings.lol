@@ -5,7 +5,11 @@ import { BlogPage } from "./BlogPage";
 import { ArticlePage } from "./ArticlePage";
 import { PricingPage } from "./PricingPage";
 import { AboutPage } from "./AboutPage";
+import { LegalPage } from "./LegalPage";
 import { getArticleBySlug } from "../../data/articles";
+import { getLegalDoc, LEGAL_DOCS } from "../../data/legal";
+
+const LEGAL_PATHS = new Set(LEGAL_DOCS.map((doc) => `/${doc.slug}`));
 
 /** All paths served by the public marketing site. */
 export function isMarketingPath(path: string): boolean {
@@ -14,7 +18,8 @@ export function isMarketingPath(path: string): boolean {
     path === "/blog" ||
     path.startsWith("/blog/") ||
     path === "/pricing" ||
-    path === "/about"
+    path === "/about" ||
+    LEGAL_PATHS.has(path)
   );
 }
 
@@ -60,6 +65,9 @@ export const MarketingSite: React.FC<MarketingSiteProps> = ({
       document.title = `Pricing • ${base}`;
     } else if (pathname === "/about") {
       document.title = `Manifesto • ${base}`;
+    } else if (LEGAL_PATHS.has(pathname)) {
+      const doc = getLegalDoc(pathname.slice(1));
+      document.title = doc ? `${doc.title} • datings.lol` : base;
     } else {
       document.title = base;
     }
@@ -84,6 +92,13 @@ export const MarketingSite: React.FC<MarketingSiteProps> = ({
     page = <PricingPage navigate={navigate} />;
   } else if (pathname === "/about") {
     page = <AboutPage navigate={navigate} />;
+  } else if (LEGAL_PATHS.has(pathname)) {
+    const doc = getLegalDoc(pathname.slice(1));
+    page = doc ? (
+      <LegalPage doc={doc} navigate={navigate} />
+    ) : (
+      <NotFound navigate={navigate} />
+    );
   } else {
     page = <NotFound navigate={navigate} />;
   }
