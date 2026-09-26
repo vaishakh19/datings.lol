@@ -2352,7 +2352,9 @@ async function startServer() {
     } catch {
       logger.warn('Vite not available — API-only dev mode (serve the UI separately).');
     }
-  } else {
+  } else if (!process.env.VERCEL) {
+    // On Vercel the SPA is served by the platform's CDN and this module runs
+    // only inside the /api serverless function, so static serving never applies.
     const distPath = path.join(process.cwd(), 'dist');
     app.use(
       express.static(distPath, {
@@ -2395,7 +2397,16 @@ process.on('uncaughtException', (err) => {
   process.exit(1);
 });
 
-startServer().catch((err) => {
-  logger.fatal({ err }, 'failed to start server');
-  process.exit(1);
-});
+// Vercel sets VERCEL=1 inside its serverless functions, where api/index.ts
+// imports this module purely as a request handler — no listener, no static
+// serving, no signal handlers. Everywhere else (`tsx server.ts` in dev,
+// `node dist/server.cjs` in a standalone deployment) the file boots a real
+// HTTP server.
+if (!process.env.VERCEL) {
+  startServer().catch((err) => {
+    logger.fatal({ err }, 'failed to start server');
+    process.exit(1);
+  });
+}
+
+export { app };

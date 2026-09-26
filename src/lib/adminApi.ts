@@ -101,12 +101,27 @@ export class AdminApiError extends Error {
 
 async function adminRequest<T>(path: string, init: RequestInit = {}): Promise<T> {
   const response = await apiFetch(path, init);
-  const body = await response.json().catch(() => ({}));
-  if (!response.ok) {
+  // An SPA-only deployment (no API functions) answers /api routes with the
+  // index.html fallback and HTTP 200. Parsing then fails, so treat anything
+  // that is not a JSON object as a hard error instead of returning `{}` —
+  // that empty object used to satisfy callers and crash the panel on render.
+  const body: unknown = await response.json().catch(() => null);
+  const bodyIsObject = body !== null && typeof body === "object" && !Array.isArray(body);
+  const bodyError = bodyIsObject && typeof (body as { error?: unknown }).error === "string"
+    ? (body as { error: string }).error
+    : null;
+  const bodyCode = bodyIsObject && typeof (body as { code?: unknown }).code === "string"
+    ? (body as { code: string }).code
+    : undefined;
+
+  if (!response.ok || !bodyIsObject) {
     throw new AdminApiError(
-      typeof body?.error === "string" ? body.error : "The admin request could not be completed.",
+      bodyError ??
+        (body === null
+          ? "The admin API did not return a valid response. Verify the deployment includes the API."
+          : "The admin request could not be completed."),
       response.status,
-      typeof body?.code === "string" ? body.code : undefined,
+      bodyCode,
     );
   }
   return body as T;

@@ -20,6 +20,26 @@ React/Vite frontend, Express API, Supabase authentication, and private cross-dev
    npm run dev
    ```
 
+## Deploying to Vercel
+
+The site is a Vite SPA plus an Express API, and both must ship together:
+
+- `api/index.ts` is the serverless entry point — it imports the Express app from `server.ts` and handles every `/api/*` request (routing lives in `vercel.json`).
+- The SPA is built with `vite build` and served from `dist/`, with all other paths falling back to `index.html`.
+
+Required environment variables (Vercel → Project → Settings → Environment Variables), applied to **Production** and **Preview**:
+
+| Variable | Notes |
+| --- | --- |
+| `SUPABASE_URL` | Server-side Supabase project URL (never prefixed with `VITE_`) |
+| `SUPABASE_SERVICE_ROLE_KEY` | Server-only key; never expose it to the browser |
+| `VITE_SUPABASE_URL` / `VITE_SUPABASE_PUBLISHABLE_KEY` | Baked into the SPA at build time |
+| `GEMINI_API_KEY` | Optional; enables the AI coach |
+
+Without `SUPABASE_URL` and `SUPABASE_SERVICE_ROLE_KEY` the function refuses to boot (by design), so set them before the first deploy.
+
+Verify a deployment with `curl https://datings.lol/healthz` — it must return `{"status":"ok",...}` JSON. If you get the sign-in page HTML instead, the API is not being routed to the function and every API-dependent feature (coach, Pro entitlements, the admin panel) is broken.
+
 ## Cross-device data
 
 Authenticated account state is stored in `public.user_app_state` and protected by Supabase Row Level Security. A user can only select, insert, update, or delete their own row. The synchronized payload includes:
@@ -46,6 +66,17 @@ on conflict (user_id) do nothing;
 ```
 
 `ADMIN_USER_IDS` can be used as a comma-separated emergency allowlist. Keep it server-side and prefer the `admin_users` table for normal operations. Admin changes are written to `audit_logs`. Published broadcasts and daily programming are returned by the read-only `/api/app-config` endpoint so every signed-in device sees the same configuration.
+
+To confirm your own account is registered as an admin, run this in the Supabase SQL editor — it inserts your account by email and shows the current list:
+
+```sql
+insert into public.admin_users (user_id)
+select id from auth.users where lower(email) = lower('YOUR_EMAIL_HERE')
+on conflict (user_id) do nothing;
+
+select u.email, u.created_at from public.admin_users a
+join auth.users u on u.id = a.user_id;
+```
 
 The control center includes live product metrics, member/plan operations, progress reset with confirmation, daily mission and hot-take publishing, broadcasts, progressive feature rollouts, system status, loading/error states, and an audit log. In local `ALLOW_DEMO_MODE=true`, any authenticated demo identity can exercise these workflows against the in-memory store; this exception is never active in production.
 
