@@ -55,35 +55,38 @@ const envSchema = z.object({
   LOG_LEVEL: z.enum(['fatal', 'error', 'warn', 'info', 'debug', 'trace']).default('info'),
 });
 
-const envResult = envSchema.safeParse(process.env);
-if (!envResult.success) {
-  console.error('FATAL: invalid environment variables:', envResult.error.flatten().fieldErrors);
-  process.exit(1);
-}
-const env = envResult.data;
-
-const isProd = env.NODE_ENV === 'production';
-const demoMode = env.ALLOW_DEMO_MODE === 'true';
 const onVercel = Boolean(process.env.VERCEL);
-const SUPABASE_URL = env.SUPABASE_URL ?? env.VITE_SUPABASE_URL ?? null;
-const SUPABASE_SERVICE_ROLE_KEY = env.SUPABASE_SERVICE_ROLE_KEY ?? null;
-const GEMINI_API_KEY =
-  env.GEMINI_API_KEY && env.GEMINI_API_KEY !== 'MY_GEMINI_API_KEY' ? env.GEMINI_API_KEY : null;
+const envResult = envSchema.safeParse(process.env);
+let bootProblem: string | null = null;
 
 // A misconfigured standalone server must fail fast and loudly. Inside a
 // Vercel serverless function, however, process.exit() at import time turns
 // every request into an opaque 500 FUNCTION_INVOCATION_FAILED page. There we
 // record the problem instead and answer every request with a clear JSON 503
 // (see the boot-problem middleware below the health checks).
-let bootProblem: string | null = null;
 const fatal = (message: string): void => {
   if (onVercel) {
-    bootProblem = message;
+    bootProblem = bootProblem ? `${bootProblem} ${message}` : message;
     return;
   }
   console.error(`FATAL: ${message}`);
   process.exit(1);
 };
+
+if (!envResult.success) {
+  fatal(`Invalid environment variables: ${JSON.stringify(envResult.error.flatten().fieldErrors)}.`);
+}
+// On Vercel with invalid env values, safe defaults keep module evaluation
+// alive so the JSON 503 responder can explain the problem instead of the
+// function crashing. (fatal() above already exited on standalone servers.)
+const env = envResult.success ? envResult.data : envSchema.parse({});
+
+const isProd = env.NODE_ENV === 'production';
+const demoMode = env.ALLOW_DEMO_MODE === 'true';
+const SUPABASE_URL = env.SUPABASE_URL ?? env.VITE_SUPABASE_URL ?? null;
+const SUPABASE_SERVICE_ROLE_KEY = env.SUPABASE_SERVICE_ROLE_KEY ?? null;
+const GEMINI_API_KEY =
+  env.GEMINI_API_KEY && env.GEMINI_API_KEY !== 'MY_GEMINI_API_KEY' ? env.GEMINI_API_KEY : null;
 
 if (isProd && demoMode) {
   fatal('ALLOW_DEMO_MODE must be false when NODE_ENV=production.');
