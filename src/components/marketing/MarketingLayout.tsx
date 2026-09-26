@@ -1,6 +1,7 @@
 import React, { useState } from "react";
 import { ArrowRight, Menu, X } from "lucide-react";
 import { SORTED_ARTICLES } from "../../data/articles";
+import { LEGAL_DOCS } from "../../data/legal";
 
 export interface MarketingNavProps {
   navigate: (path: string) => void;
@@ -197,8 +198,27 @@ export const MarketingFooter: React.FC<{ navigate: (path: string) => void }> = (
             </ul>
           </div>
 
+          {/* Legal */}
+          <div className="md:col-span-2">
+            <div className="text-[11px] font-black uppercase tracking-widest text-white/40 mb-3">
+              Legal
+            </div>
+            <ul className="space-y-2 text-[14px] font-bold">
+              {LEGAL_DOCS.map((doc) => (
+                <li key={doc.slug}>
+                  <button
+                    onClick={() => navigate(`/${doc.slug}`)}
+                    className="text-left hover:text-[#FFE066] transition-colors"
+                  >
+                    {doc.label}
+                  </button>
+                </li>
+              ))}
+            </ul>
+          </div>
+
           {/* All articles */}
-          <div className="md:col-span-6">
+          <div className="md:col-span-4">
             <div className="text-[11px] font-black uppercase tracking-widest text-white/40 mb-3">
               All articles
             </div>
@@ -230,13 +250,18 @@ export const MarketingFooter: React.FC<{ navigate: (path: string) => void }> = (
           <div className="text-[12px] font-bold text-white/40">
             © {new Date().getFullYear()} datings.lol — get better at dating. brutally.
           </div>
-          <div className="flex items-center gap-2 text-[10px] font-black uppercase tracking-widest">
-            <span className="px-2.5 py-1 bg-white/10 border-[2px] border-white/20 rounded-full">
-              No fake gurus
-            </span>
-            <span className="px-2.5 py-1 bg-white/10 border-[2px] border-white/20 rounded-full">
-              No 200-page PDFs
-            </span>
+          <div className="flex flex-wrap items-center justify-center gap-x-3 gap-y-1 text-[12px] font-bold text-white/50">
+            {LEGAL_DOCS.map((doc, i) => (
+              <React.Fragment key={doc.slug}>
+                {i > 0 && <span className="text-white/25">·</span>}
+                <button
+                  onClick={() => navigate(`/${doc.slug}`)}
+                  className="hover:text-[#FFE066] transition-colors"
+                >
+                  {doc.label}
+                </button>
+              </React.Fragment>
+            ))}
           </div>
         </div>
       </div>
