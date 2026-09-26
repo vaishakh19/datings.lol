@@ -8,7 +8,7 @@ interface AuthContextValue {
   loading: boolean;
   authError: string | null;
   signIn: (email: string, password: string) => Promise<{ error?: string }>;
-  signUp: (email: string, password: string, metadata?: Record<string, unknown>) => Promise<{ user: User | null; needsEmailConfirmation: boolean; error?: string }>;
+  signUp: (email: string, password: string, metadata?: Record<string, unknown>) => Promise<{ user: User | null; needsEmailConfirmation: boolean; emailTaken?: boolean; error?: string }>;
   signOut: () => Promise<{ error?: string }>;
   resetPassword: (email: string) => Promise<{ error?: string }>;
   updatePassword: (password: string) => Promise<{ error?: string }>;
@@ -27,6 +27,13 @@ function friendlyAuthError(error: unknown): string {
   if (lower.includes("rate limit") || lower.includes("too many")) return "Too many attempts. Please wait a moment and try again.";
   if (lower.includes("failed to fetch") || lower.includes("network")) return "Supabase is unavailable right now. Check your connection and retry.";
   return "Something went sideways. Please try again.";
+}
+
+function isEmailTakenError(error: unknown): boolean {
+  const code = (error as { code?: string } | null)?.code?.toLowerCase() || "";
+  if (code === "user_already_exists" || code === "email_exists") return true;
+  const message = (error instanceof Error ? error.message : String(error || "")).toLowerCase();
+  return message.includes("user already registered") || message.includes("already been registered") || message.includes("already exists");
 }
 
 export function AuthProvider({ children }: { children: React.ReactNode }) {
@@ -70,7 +77,26 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
         password,
         options: { data: metadata, emailRedirectTo: `${window.location.origin}/auth/callback` },
       });
-      if (error) { const message = friendlyAuthError(error); setAuthError(message); return { user: null, needsEmailConfirmation: false, error: message }; }
+      if (error) {
+        const message = friendlyAuthError(error);
+        if (isEmailTakenError(error)) {
+          // Don't push this into the shared banner - the form renders a dedicated block.
+          return { user: null, needsEmailConfirmation: false, emailTaken: true, error: message };
+        }
+        setAuthError(message);
+        return { user: null, needsEmailConfirmation: false, error: message };
+      }
+      // When "Confirm email" is enabled, Supabase does NOT error on a duplicate signup.
+      // It returns an obfuscated user with an empty `identities` array instead, so we
+      // have to detect that ourselves or the user sits on "check your email" forever.
+      if (data.user && Array.isArray(data.user.identities) && data.user.identities.length === 0) {
+        return {
+          user: null,
+          needsEmailConfirmation: false,
+          emailTaken: true,
+          error: "An account already exists for this email. Try signing in instead.",
+        };
+      }
       return { user: data.user, needsEmailConfirmation: !data.session };
     },
     async signOut() {

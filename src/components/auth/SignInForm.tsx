@@ -1,15 +1,21 @@
-import React, { useState } from "react";
+import React, { useEffect, useState } from "react";
 import { ArrowRight, Eye, EyeOff, Lock, User } from "lucide-react";
 import { AuthView } from "../../types";
 import { useAuth } from "../../context/AuthContext";
 
-export function SignInForm({ onNavigate }: { onSuccess?: unknown; onNavigate: (view: AuthView, identifier?: string) => void; initialIdentifier?: string }) {
+export function SignInForm({ onNavigate, initialIdentifier = "" }: { onSuccess?: unknown; onNavigate: (view: AuthView, identifier?: string) => void; initialIdentifier?: string }) {
   const { signIn, authError, clearAuthError } = useAuth();
-  const [email, setEmail] = useState("");
+  const [email, setEmail] = useState(initialIdentifier);
   const [password, setPassword] = useState("");
   const [showPassword, setShowPassword] = useState(false);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState("");
+
+  // Keep in sync when the container hands us an identifier (e.g. from the
+  // "email already registered" block on the sign-up tab).
+  useEffect(() => {
+    if (initialIdentifier) setEmail(initialIdentifier);
+  }, [initialIdentifier]);
 
   const submit = async (event: React.FormEvent) => {
     event.preventDefault();
