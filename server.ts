@@ -69,6 +69,11 @@ const SUPABASE_SERVICE_ROLE_KEY = env.SUPABASE_SERVICE_ROLE_KEY ?? null;
 const GEMINI_API_KEY =
   env.GEMINI_API_KEY && env.GEMINI_API_KEY !== 'MY_GEMINI_API_KEY' ? env.GEMINI_API_KEY : null;
 
+if (isProd && demoMode) {
+  console.error('FATAL: ALLOW_DEMO_MODE must be false when NODE_ENV=production.');
+  process.exit(1);
+}
+
 if (!demoMode && (!SUPABASE_URL || !SUPABASE_SERVICE_ROLE_KEY)) {
   console.error('FATAL: SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY are required in production.');
   console.error('       Set ALLOW_DEMO_MODE=true only for local development without a database.');
@@ -326,6 +331,10 @@ async function requireAdmin(req: Request, res: Response): Promise<string | null>
   const userId = await requireAuth(req, res);
   if (!userId) return null;
 
+  // Demo mode is an explicitly local-only environment. Let its authenticated
+  // test identity exercise the panel while production always uses the database
+  // membership table (or the emergency ADMIN_USER_IDS allowlist).
+  if (demoMode) return userId;
   if (configuredAdminIds().includes(userId)) return userId;
 
   if (!SUPABASE_URL || !SUPABASE_SERVICE_ROLE_KEY) {
@@ -855,71 +864,108 @@ function createSupabaseStore(): DataStore {
     admin: {
       async dashboard() {
         const today = todayKey();
-        const [users, proUsers, activeToday, totalXp, coachMessagesToday, tasksCompletedToday, profileAudits, activeStreaks] =
-          await Promise.all([
-            metric('users', () => count('profiles'), 0),
-            metric('proUsers', () => count('subscriptions', (q) => q.eq('status', 'active').eq('plan', 'pro')), 0),
-            metric('activeToday', () => count('profiles', (q) => q.eq('last_active_date', today)), 0),
-            metric('totalXp', async () => {
-              const { data, error } = await sb().from('profiles').select('xp').limit(10000);
-              if (error) throw error;
-              return (data ?? []).reduce((sum: number, r: any) => sum + Number(r.xp || 0), 0);
-            }, 0),
-            metric('coachMessagesToday', () => count('coach_usage', (q) => q.gte('created_at', startOfTodayIso())), 0),
-            metric('tasksCompletedToday', () => count('daily_tasks', (q) => q.eq('completed', true).gte('completed_at', startOfTodayIso())), 0),
-            metric('profileAudits', () => count('profile_audits'), 0),
-            metric('activeStreaks', () => count('profiles', (q) => q.gt('streak', 0)), 0),
-          ]);
+        const localToday = new Date().toDateString();
+        const [authTotal, appStates, proUsers, dbProfileAudits] = await Promise.all([
+          metric('users', async () => {
+            const { data, error } = await sb().auth.admin.listUsers({ page: 1, perPage: 1 });
+            if (error) throw error;
+            return Number((data as any).total ?? data.users.length);
+          }, 0),
+          metric('userAppState', async () => {
+            const { data, error } = await sb()
+              .from('user_app_state')
+              .select('user_id, state, updated_at')
+              .limit(10000);
+            if (error) throw error;
+            return data ?? [];
+          }, [] as any[]),
+          metric('proUsers', () => count('subscriptions', (q) => q.eq('status', 'active').eq('plan', 'pro')), 0),
+          metric('profileAudits', () => count('profile_audits'), 0),
+        ]);
+
+        const activeToday = appStates.filter((row: any) => String(row.updated_at || '').slice(0, 10) === today).length;
+        const totalXp = appStates.reduce(
+          (sum: number, row: any) => sum + Number(row.state?.progress?.xp || 0),
+          0,
+        );
+        const coachMessagesToday = appStates.reduce(
+          (sum: number, row: any) =>
+            sum + (row.state?.lastChatDate === today ? Number(row.state?.chatsUsedToday || 0) : 0),
+          0,
+        );
+        const tasksCompletedToday = appStates.filter(
+          (row: any) => row.state?.progress?.lastCompletedDate === localToday,
+        ).length;
+        const activeStreaks = appStates.filter((row: any) => Number(row.state?.progress?.streak || 0) > 0).length;
+        const syncedProfileAudits = appStates.filter((row: any) => Boolean(row.state?.profileAudit)).length;
+
         return {
-          users,
+          users: authTotal || appStates.length,
           proUsers,
           activeToday,
           totalXp,
           coachMessagesToday,
           tasksCompletedToday,
           communityTeachings: TEACHINGS.length,
-          profileAudits,
+          profileAudits: Math.max(dbProfileAudits, syncedProfileAudits),
           activeStreaks,
         };
       },
       async users(search) {
-        const needle = search.toLowerCase();
-        let query = sb().from('profiles').select('id, username, email, xp, streak').limit(500);
-        if (needle) query = query.or(`username.ilike.%${needle}%,email.ilike.%${needle}%`);
-        const [{ data: rows, error }, { data: proRows }] = await Promise.all([
-          query,
+        const needle = search.trim().toLowerCase();
+        const [profileResult, stateResult, proResult, authResult] = await Promise.all([
+          sb().from('profiles').select('id, username, xp, created_at').limit(500),
+          sb().from('user_app_state').select('user_id, state, updated_at').limit(500),
           sb().from('subscriptions').select('user_id').eq('status', 'active').eq('plan', 'pro'),
+          sb().auth.admin.listUsers({ page: 1, perPage: 500 }),
         ]);
-        if (error) {
-          logger.warn({ err: error }, 'admin users query failed');
+        if (authResult.error) {
+          logger.warn({ err: authResult.error }, 'admin auth users query failed');
           return [];
         }
-        const proSet = new Set((proRows ?? []).map((r: any) => r.user_id));
-        return (rows ?? [])
+        if (profileResult.error) logger.warn({ err: profileResult.error }, 'admin profiles query failed');
+        if (stateResult.error) logger.warn({ err: stateResult.error }, 'admin app state query failed');
+
+        const profileById = new Map((profileResult.data ?? []).map((row: any) => [row.id, row]));
+        const stateById = new Map((stateResult.data ?? []).map((row: any) => [row.user_id, row]));
+        const proSet = new Set((proResult.data ?? []).map((row: any) => row.user_id));
+
+        return (authResult.data?.users ?? [])
+          .map((authUser: any) => {
+            const profile: any = profileById.get(authUser.id);
+            const appRow: any = stateById.get(authUser.id);
+            const state = appRow?.state ?? {};
+            return {
+              id: authUser.id,
+              username:
+                profile?.username ||
+                authUser.user_metadata?.username ||
+                authUser.email?.split('@')[0] ||
+                'member',
+              email: authUser.email || '',
+              xp: Number(state.progress?.xp ?? profile?.xp ?? 0),
+              streak: Number(state.progress?.streak ?? 0),
+              isPro: proSet.has(authUser.id),
+              createdAt: authUser.created_at || profile?.created_at,
+              lastSignInAt: appRow?.updated_at || authUser.last_sign_in_at,
+            };
+          })
           .filter(
-            (r: any) =>
+            (row: any) =>
               !needle ||
-              String(r.id).toLowerCase().includes(needle) ||
-              String(r.username ?? '').toLowerCase().includes(needle) ||
-              String(r.email ?? '').toLowerCase().includes(needle),
-          )
-          .map((r: any) => ({
-            id: r.id,
-            username: r.username,
-            email: r.email,
-            xp: r.xp || 0,
-            streak: r.streak || 0,
-            isPro: proSet.has(r.id),
-          }));
+              String(row.id).toLowerCase().includes(needle) ||
+              String(row.username).toLowerCase().includes(needle) ||
+              String(row.email).toLowerCase().includes(needle),
+          );
       },
       async setFeatureFlag(adminId, key, state) {
         const { error } = await sb()
-          .from('admin_features')
+          .from('feature_flags')
           .upsert({ key, state, updated_by: adminId, updated_at: new Date().toISOString() }, { onConflict: 'key' });
         if (error) throw new ApiError(500, 'Failed to update feature flag.');
-        const { error: auditError } = await sb().from('admin_audit_logs').insert({
+        const { error: auditError } = await sb().from('audit_logs').insert({
           admin_user_id: adminId,
-          action: 'CHANGED FEATURE FLAG',
+          action: 'CHANGED_FEATURE_FLAG',
           target_type: 'feature_flag',
           target_id: key,
           metadata: { state },
@@ -1080,7 +1126,16 @@ const coachLimiter = rateLimit({
   message: { error: 'Too many coach requests, slow down.' },
 });
 
+const adminLimiter = rateLimit({
+  windowMs: 60 * 1000,
+  limit: 180,
+  standardHeaders: 'draft-7',
+  legacyHeaders: false,
+  message: { error: 'Too many admin requests. Wait a moment and try again.' },
+});
+
 app.use('/api', apiLimiter);
+app.use('/api/admin', adminLimiter);
 
 // ============================================================================
 // INPUT VALIDATION SCHEMAS
@@ -1125,7 +1180,52 @@ const journalPatchSchema = z
   .refine((d) => d.title !== undefined || d.content !== undefined, { message: 'Nothing to update.' });
 
 const reactionSchema = z.object({ reaction: z.enum(['🔥', '💀', '💡', '❤️']) }).strict();
-const featureFlagSchema = z.object({ state: z.enum(['ON', 'OFF', 'BETA']) }).strict();
+const featureFlagSchema = z
+  .object({
+    state: z.enum(['ON', 'OFF', 'BETA']),
+    rolloutPercent: z.coerce.number().int().min(0).max(100).optional(),
+  })
+  .strict();
+const adminPlanSchema = z.object({ plan: z.enum(['free', 'pro']) }).strict();
+const resetProgressSchema = z.object({ confirmation: z.literal('RESET_PROGRESS') }).strict();
+const broadcastCreateSchema = z
+  .object({
+    title: z.string().trim().min(1).max(80),
+    message: z.string().trim().min(1).max(500),
+    tone: z.enum(['update', 'warning', 'win']).default('update'),
+    status: z.enum(['DRAFT', 'LIVE']).default('DRAFT'),
+    expiresAt: z.string().datetime().optional(),
+  })
+  .strict();
+const broadcastPatchSchema = z.object({ status: z.enum(['DRAFT', 'LIVE', 'ARCHIVED']) }).strict();
+const dailyConfigSchema = z
+  .object({
+    lessonId: z.number().int().positive().nullable(),
+    mode: z.enum(['AUTOMATIC', 'MANUAL']),
+    focus: z.string().trim().max(120),
+    note: z.string().trim().max(1000),
+    taskType: z.enum(['LEARN', 'PRACTICE', 'SIMULATION', 'REAL_WORLD', 'REVIEW']),
+    difficulty: z.enum(['BEGINNER', 'INTERMEDIATE', 'ADVANCED', 'BRUTAL']),
+    xpReward: z.coerce.number().int().min(0).max(500),
+  })
+  .strict();
+const hotTakeSchema = z
+  .object({
+    topic: z.string().trim().min(1).max(50),
+    statement: z.string().trim().min(1).max(280),
+    subtext: z.string().trim().max(280),
+    agreePercent: z.number().min(0).max(100),
+    disagreePercent: z.number().min(0).max(100),
+    complicatedPercent: z.number().min(0).max(100),
+    coachInsight: z.object({
+      agree: z.string().max(500),
+      disagree: z.string().max(500),
+      complicated: z.string().max(500),
+    }),
+    bonusXp: z.number().int().min(0).max(500),
+    updatedAt: z.string().optional(),
+  })
+  .strict();
 
 // ============================================================================
 // HEALTH CHECKS
@@ -1449,9 +1549,304 @@ app.delete(
   }),
 );
 
+app.get(
+  '/api/account/entitlements',
+  ah(async (req, res) => {
+    const userId = await requireAuth(req, res);
+    if (!userId) return;
+    const plan = await store.coach.getPlan(userId);
+    res.setHeader('Cache-Control', 'private, no-store');
+    res.json({ plan, isPro: plan === 'pro' });
+  }),
+);
+
 // ============================================================================
-// API ROUTES: ADMIN & SYSTEM (same contract as before, real metrics)
+// API ROUTES: ADMIN & SYSTEM
 // ============================================================================
+
+const DEFAULT_ADMIN_FEATURES = [
+  { key: 'AI_COACH', state: 'ON', rolloutPercent: 100, description: 'AI coach chat and response generation' },
+  { key: 'SCREENSHOT_ANALYSIS', state: 'ON', rolloutPercent: 100, description: 'Conversation screenshot analysis' },
+  { key: 'AI_SIMULATOR', state: 'BETA', rolloutPercent: 25, description: 'Interactive conversation simulator' },
+  { key: 'COMMUNITY', state: 'ON', rolloutPercent: 100, description: 'Community lessons and hot takes' },
+  { key: 'DAILY_TASKS', state: 'ON', rolloutPercent: 100, description: 'Personalized daily mission engine' },
+  { key: 'PROFILE_AUDIT', state: 'ON', rolloutPercent: 100, description: 'AI dating profile audit' },
+  { key: 'PAYWALL', state: 'ON', rolloutPercent: 100, description: 'Pro upgrade surfaces' },
+] as const;
+
+const defaultDailyConfig = () => ({
+  lessonId: null as number | null,
+  mode: 'AUTOMATIC' as const,
+  focus: '',
+  note: '',
+  taskType: 'PRACTICE' as const,
+  difficulty: 'INTERMEDIATE' as const,
+  xpReward: 25,
+  updatedAt: new Date(0).toISOString(),
+});
+
+let demoAdminFeatures: Array<{
+  key: string;
+  state: 'ON' | 'OFF' | 'BETA';
+  rolloutPercent: number;
+  description: string;
+  updatedAt: string;
+}> = DEFAULT_ADMIN_FEATURES.map((feature) => ({
+  ...feature,
+  updatedAt: new Date().toISOString(),
+}));
+let demoAdminBroadcasts: any[] = [];
+let demoDailyConfig: any = defaultDailyConfig();
+let demoDailyHotTake: any = null;
+let demoAuditLogs: any[] = [];
+
+function mapFeatureFlag(row: any) {
+  return {
+    key: String(row.key),
+    state: row.state as 'ON' | 'OFF' | 'BETA',
+    rolloutPercent: Number(row.rollout_percent ?? row.rolloutPercent ?? 100),
+    description: String(row.description ?? ''),
+    updatedAt: row.updated_at ?? row.updatedAt ?? new Date().toISOString(),
+  };
+}
+
+function mapBroadcast(row: any) {
+  const status = String(row.status || 'DRAFT');
+  return {
+    id: String(row.id),
+    title: String(row.title),
+    message: String(row.message),
+    tone: row.tone as 'update' | 'warning' | 'win',
+    status,
+    audience: String(row.audience || 'ALL_USERS'),
+    createdAt: row.created_at ?? row.createdAt ?? new Date().toISOString(),
+    expiresAt: row.expires_at ?? row.expiresAt ?? undefined,
+    isActive: status === 'LIVE',
+  };
+}
+
+function mapDailyConfig(row: any) {
+  if (!row) return defaultDailyConfig();
+  return {
+    id: row.id,
+    lessonId: row.lesson_id == null ? null : Number(row.lesson_id),
+    mode: row.mode === 'MANUAL' ? 'MANUAL' : 'AUTOMATIC',
+    focus: String(row.focus ?? ''),
+    note: String(row.note ?? row.coach_prompt ?? ''),
+    taskType: row.task_type || 'PRACTICE',
+    difficulty: row.difficulty || 'INTERMEDIATE',
+    xpReward: Number(row.xp_reward ?? 25),
+    updatedAt: row.updated_at ?? new Date(0).toISOString(),
+  };
+}
+
+function mapAudit(row: any) {
+  return {
+    id: String(row.id),
+    actorId: row.admin_user_id ? String(row.admin_user_id) : undefined,
+    action: String(row.action),
+    targetType: String(row.target_type),
+    targetId: String(row.target_id),
+    metadata: row.metadata && typeof row.metadata === 'object' ? row.metadata : {},
+    createdAt: row.created_at ?? new Date().toISOString(),
+  };
+}
+
+async function writeAdminAudit(
+  adminId: string,
+  action: string,
+  targetType: string,
+  targetId: string,
+  metadata: Record<string, unknown> = {},
+) {
+  if (demoMode) {
+    demoAuditLogs = [
+      {
+        id: crypto.randomUUID(),
+        actorId: adminId,
+        action,
+        targetType,
+        targetId,
+        metadata,
+        createdAt: new Date().toISOString(),
+      },
+      ...demoAuditLogs,
+    ].slice(0, 100);
+    return;
+  }
+  const { error } = await sb().from('audit_logs').insert({
+    admin_user_id: adminId,
+    action,
+    target_type: targetType,
+    target_id: targetId,
+    metadata,
+  });
+  if (error) logger.warn({ err: error, action, targetId }, 'admin audit insert failed');
+}
+
+function emptyAdminTrend(days = 14) {
+  return Array.from({ length: days }, (_, index) => {
+    const date = new Date();
+    date.setUTCDate(date.getUTCDate() - (days - index - 1));
+    return { date: date.toISOString().slice(0, 10), active: 0, completions: 0 };
+  });
+}
+
+async function getProductionAdminExtras() {
+  const trend = emptyAdminTrend();
+  const since = trend[0].date;
+  const [featureResult, broadcastResult, dailyResult, hotTakeResult, auditResult, analyticsResult] =
+    await Promise.all([
+      sb().from('feature_flags').select('*').order('key'),
+      sb().from('broadcasts').select('*').order('created_at', { ascending: false }).limit(30),
+      sb().from('daily_lesson_config').select('*').order('updated_at', { ascending: false }).limit(1).maybeSingle(),
+      sb().from('system_settings').select('value').eq('key', 'daily_hot_take').maybeSingle(),
+      sb().from('audit_logs').select('*').order('created_at', { ascending: false }).limit(50),
+      sb().from('analytics_daily').select('metric_date, metric_key, metric_value').gte('metric_date', since),
+    ]);
+
+  for (const row of analyticsResult.data ?? []) {
+    const point = trend.find((item) => item.date === row.metric_date);
+    if (!point) continue;
+    if (row.metric_key === 'active_users') point.active = Number(row.metric_value || 0);
+    if (row.metric_key === 'tasks_completed') point.completions = Number(row.metric_value || 0);
+  }
+
+  return {
+    features: featureResult.error
+      ? DEFAULT_ADMIN_FEATURES.map(mapFeatureFlag)
+      : (featureResult.data ?? []).map(mapFeatureFlag),
+    broadcasts: broadcastResult.error ? [] : (broadcastResult.data ?? []).map(mapBroadcast),
+    dailyConfig: dailyResult.error ? defaultDailyConfig() : mapDailyConfig(dailyResult.data),
+    dailyHotTake: hotTakeResult.error ? null : (hotTakeResult.data?.value ?? null),
+    audits: auditResult.error ? [] : (auditResult.data ?? []).map(mapAudit),
+    trend,
+    degraded: Boolean(
+      featureResult.error || broadcastResult.error || dailyResult.error || auditResult.error,
+    ),
+  };
+}
+
+function getSystemServices(degraded = false) {
+  return [
+    {
+      name: 'API',
+      status: 'operational',
+      detail: `${Math.round(process.uptime() / 60)}m uptime`,
+    },
+    {
+      name: 'Database',
+      status: degraded ? 'degraded' : 'operational',
+      detail: demoMode ? 'in-memory demo store' : degraded ? 'one or more queries failed' : 'Supabase connected',
+    },
+    {
+      name: 'Authentication',
+      status: 'operational',
+      detail: demoMode ? 'demo identity' : 'JWT verification active',
+    },
+    {
+      name: 'AI coach',
+      status: GEMINI_API_KEY ? 'operational' : 'not_configured',
+      detail: GEMINI_API_KEY ? 'Gemini configured' : 'API key not configured',
+    },
+  ];
+}
+
+// Public, read-only product configuration. It contains no admin identity or
+// private data and lets every device receive the currently published controls.
+app.get(
+  '/api/app-config',
+  ah(async (_req, res) => {
+    if (demoMode) {
+      return res.json({
+        settings: {
+          notifications: demoAdminBroadcasts.filter((item) => item.status === 'LIVE'),
+          dailyOverride: {
+            lessonId: demoDailyConfig.lessonId,
+            focus: demoDailyConfig.focus,
+            note: demoDailyConfig.note,
+            updatedAt: demoDailyConfig.updatedAt,
+          },
+          dailyHotTake: demoDailyHotTake,
+        },
+      });
+    }
+
+    const [broadcastResult, dailyResult, hotTakeResult] = await Promise.all([
+      sb().from('broadcasts').select('*').eq('status', 'LIVE').order('created_at', { ascending: false }).limit(20),
+      sb().from('daily_lesson_config').select('*').order('updated_at', { ascending: false }).limit(1).maybeSingle(),
+      sb().from('system_settings').select('value').eq('key', 'daily_hot_take').maybeSingle(),
+    ]);
+    const now = Date.now();
+    const notifications = (broadcastResult.data ?? [])
+      .map(mapBroadcast)
+      .filter((item) => !item.expiresAt || new Date(item.expiresAt).getTime() > now);
+    const daily = mapDailyConfig(dailyResult.data);
+    res.setHeader('Cache-Control', 'private, max-age=30');
+    res.json({
+      settings: {
+        notifications,
+        dailyOverride: {
+          lessonId: daily.lessonId,
+          focus: daily.focus,
+          note: daily.note,
+          updatedAt: daily.updatedAt,
+        },
+        dailyHotTake: hotTakeResult.data?.value ?? null,
+      },
+    });
+  }),
+);
+
+app.get(
+  '/api/admin/session',
+  ah(async (req, res) => {
+    const adminId = await requireAdmin(req, res);
+    if (!adminId) return;
+    res.json({ adminId, role: 'ADMIN', mode: demoMode ? 'demo' : 'production' });
+  }),
+);
+
+app.get(
+  '/api/admin/overview',
+  ah(async (req, res) => {
+    const adminId = await requireAdmin(req, res);
+    if (!adminId) return;
+    const metrics = await store.admin.dashboard();
+    if (demoMode) {
+      const trend = emptyAdminTrend().map((point, index) => ({
+        ...point,
+        active: Math.max(0, Math.round(8 + index * 1.7 + Math.sin(index) * 4)),
+        completions: Math.max(0, Math.round(3 + index * 0.8 + Math.cos(index) * 2)),
+      }));
+      return res.json({
+        metrics,
+        features: demoAdminFeatures,
+        broadcasts: demoAdminBroadcasts,
+        dailyConfig: demoDailyConfig,
+        dailyHotTake: demoDailyHotTake,
+        audits: demoAuditLogs,
+        trend,
+        services: getSystemServices(false),
+        generatedAt: new Date().toISOString(),
+        mode: 'demo',
+      });
+    }
+    const extras = await getProductionAdminExtras();
+    const todayPoint = extras.trend.at(-1);
+    if (todayPoint) {
+      todayPoint.active = metrics.activeToday;
+      todayPoint.completions = metrics.tasksCompletedToday;
+    }
+    res.json({
+      metrics,
+      ...extras,
+      services: getSystemServices(extras.degraded),
+      generatedAt: new Date().toISOString(),
+      mode: 'production',
+    });
+  }),
+);
 
 app.get(
   '/api/admin/dashboard',
@@ -1477,14 +1872,259 @@ app.get(
 );
 
 app.patch(
+  '/api/admin/users/:id/plan',
+  ah(async (req, res) => {
+    const adminId = await requireAdmin(req, res);
+    if (!adminId) return;
+    const userId = z.string().uuid().safeParse(req.params.id);
+    if (!userId.success) throw badRequest('Invalid user id.');
+    const body = parseBody(adminPlanSchema, req.body);
+
+    if (!demoMode) {
+      const isPro = body.plan === 'pro';
+      const [{ error }, { error: stateError }] = await Promise.all([
+        sb().from('subscriptions').upsert(
+          {
+            user_id: userId.data,
+            plan: body.plan,
+            status: isPro ? 'active' : 'inactive',
+            provider: 'admin',
+            updated_at: new Date().toISOString(),
+          },
+          { onConflict: 'user_id' },
+        ),
+        sb().rpc('admin_set_user_pro', { p_user_id: userId.data, p_is_pro: isPro }),
+      ]);
+      if (error || stateError) throw new ApiError(500, 'Failed to update the user plan.');
+    }
+    await writeAdminAudit(adminId, body.plan === 'pro' ? 'GRANTED_PRO' : 'REVOKED_PRO', 'user', userId.data, {
+      plan: body.plan,
+    });
+    res.json({ userId: userId.data, plan: body.plan });
+  }),
+);
+
+app.post(
+  '/api/admin/users/:id/reset-progress',
+  ah(async (req, res) => {
+    const adminId = await requireAdmin(req, res);
+    if (!adminId) return;
+    const userId = z.string().uuid().safeParse(req.params.id);
+    if (!userId.success) throw badRequest('Invalid user id.');
+    parseBody(resetProgressSchema, req.body);
+
+    if (!demoMode) {
+      const [{ error: profileError }, { error: streakError }, { error: stateError }] = await Promise.all([
+        sb().from('profiles').update({ xp: 0, level: 1, updated_at: new Date().toISOString() }).eq('id', userId.data),
+        sb()
+          .from('streaks')
+          .update({
+            current_count: 0,
+            best_count: 0,
+            last_completed_date: null,
+            updated_at: new Date().toISOString(),
+          })
+          .eq('user_id', userId.data),
+        sb().rpc('admin_reset_user_progress', { p_user_id: userId.data }),
+      ]);
+      if (profileError || streakError || stateError) throw new ApiError(500, 'Failed to reset user progress.');
+    }
+    await writeAdminAudit(adminId, 'RESET_USER_PROGRESS', 'user', userId.data);
+    res.json({ userId: userId.data, reset: true });
+  }),
+);
+
+app.post(
+  '/api/admin/broadcasts',
+  ah(async (req, res) => {
+    const adminId = await requireAdmin(req, res);
+    if (!adminId) return;
+    const body = parseBody(broadcastCreateSchema, req.body);
+    let broadcast: any;
+    if (demoMode) {
+      broadcast = mapBroadcast({
+        id: crypto.randomUUID(),
+        ...body,
+        expiresAt: body.expiresAt,
+        createdAt: new Date().toISOString(),
+      });
+      demoAdminBroadcasts = [broadcast, ...demoAdminBroadcasts];
+    } else {
+      const { data, error } = await sb()
+        .from('broadcasts')
+        .insert({
+          title: body.title,
+          message: body.message,
+          tone: body.tone,
+          status: body.status,
+          audience: 'ALL_USERS',
+          expires_at: body.expiresAt ?? null,
+          created_by: adminId,
+        })
+        .select('*')
+        .single();
+      if (error) throw new ApiError(500, 'Failed to create broadcast.');
+      broadcast = mapBroadcast(data);
+    }
+    await writeAdminAudit(adminId, body.status === 'LIVE' ? 'PUBLISHED_BROADCAST' : 'CREATED_BROADCAST_DRAFT', 'broadcast', broadcast.id, {
+      tone: body.tone,
+    });
+    res.status(201).json({ broadcast });
+  }),
+);
+
+app.patch(
+  '/api/admin/broadcasts/:id',
+  ah(async (req, res) => {
+    const adminId = await requireAdmin(req, res);
+    if (!adminId) return;
+    const body = parseBody(broadcastPatchSchema, req.body);
+    if (demoMode) {
+      demoAdminBroadcasts = demoAdminBroadcasts.map((item) =>
+        item.id === req.params.id ? { ...item, status: body.status, isActive: body.status === 'LIVE' } : item,
+      );
+    } else {
+      const { data, error } = await sb()
+        .from('broadcasts')
+        .update({ status: body.status })
+        .eq('id', req.params.id)
+        .select('id')
+        .maybeSingle();
+      if (error) throw new ApiError(500, 'Failed to update broadcast.');
+      if (!data) return res.status(404).json({ error: 'Broadcast not found.' });
+    }
+    await writeAdminAudit(adminId, `${body.status}_BROADCAST`, 'broadcast', req.params.id);
+    res.json({ id: req.params.id, status: body.status });
+  }),
+);
+
+app.put(
+  '/api/admin/daily-config',
+  ah(async (req, res) => {
+    const adminId = await requireAdmin(req, res);
+    if (!adminId) return;
+    const body = parseBody(dailyConfigSchema, req.body);
+    let dailyConfig: any;
+    if (demoMode) {
+      dailyConfig = {
+        ...body,
+        id: demoDailyConfig.id || crypto.randomUUID(),
+        updatedAt: new Date().toISOString(),
+      };
+      demoDailyConfig = dailyConfig;
+    } else {
+      const { data, error } = await sb()
+        .from('daily_lesson_config')
+        .insert({
+          lesson_id: body.lessonId,
+          mode: body.mode,
+          focus: body.focus || null,
+          note: body.note || null,
+          task_type: body.taskType,
+          difficulty: body.difficulty,
+          xp_reward: body.xpReward,
+          coach_prompt: body.note || null,
+          updated_by: adminId,
+          updated_at: new Date().toISOString(),
+        })
+        .select('*')
+        .single();
+      if (error) throw new ApiError(500, 'Failed to publish the daily mission.');
+      dailyConfig = mapDailyConfig(data);
+    }
+    await writeAdminAudit(adminId, 'PUBLISHED_DAILY_CONFIG', 'daily_lesson', String(body.lessonId ?? 'automatic'), {
+      mode: body.mode,
+      taskType: body.taskType,
+      difficulty: body.difficulty,
+      xpReward: body.xpReward,
+    });
+    res.json({ dailyConfig });
+  }),
+);
+
+app.put(
+  '/api/admin/hot-take',
+  ah(async (req, res) => {
+    const adminId = await requireAdmin(req, res);
+    if (!adminId) return;
+    const body = parseBody(hotTakeSchema, req.body);
+    const dailyHotTake = { ...body, updatedAt: new Date().toISOString() };
+    if (demoMode) {
+      demoDailyHotTake = dailyHotTake;
+    } else {
+      const { error } = await sb().from('system_settings').upsert(
+        {
+          key: 'daily_hot_take',
+          value: dailyHotTake,
+          description: 'Published daily community hot take',
+          updated_by: adminId,
+          updated_at: new Date().toISOString(),
+        },
+        { onConflict: 'key' },
+      );
+      if (error) throw new ApiError(500, 'Failed to publish the hot take.');
+    }
+    await writeAdminAudit(adminId, 'PUBLISHED_HOT_TAKE', 'hot_take', body.topic);
+    res.json({ dailyHotTake });
+  }),
+);
+
+app.patch(
   '/api/admin/features/:key',
   ah(async (req, res) => {
     const adminId = await requireAdmin(req, res);
     if (!adminId) return;
-
+    const key = req.params.key.trim().toUpperCase();
+    if (!/^[A-Z][A-Z0-9_]{1,63}$/.test(key)) throw badRequest('Invalid feature key.');
     const body = parseBody(featureFlagSchema, req.body);
-    await store.admin.setFeatureFlag(adminId, req.params.key, body.state);
-    res.json({ key: req.params.key, state: body.state });
+    let feature: any;
+    if (demoMode) {
+      demoAdminFeatures = demoAdminFeatures.map((item) =>
+        item.key === key
+          ? {
+              ...item,
+              state: body.state,
+              rolloutPercent: body.rolloutPercent ?? item.rolloutPercent,
+              updatedAt: new Date().toISOString(),
+            }
+          : item,
+      );
+      feature = demoAdminFeatures.find((item) => item.key === key);
+      if (!feature) {
+        feature = {
+          key,
+          state: body.state,
+          rolloutPercent: body.rolloutPercent ?? 100,
+          description: '',
+          updatedAt: new Date().toISOString(),
+        };
+        demoAdminFeatures.push(feature);
+      }
+    } else {
+      const { data: current } = await sb().from('feature_flags').select('*').eq('key', key).maybeSingle();
+      const { data, error } = await sb()
+        .from('feature_flags')
+        .upsert(
+          {
+            key,
+            state: body.state,
+            rollout_percent: body.rolloutPercent ?? current?.rollout_percent ?? 100,
+            description: current?.description ?? '',
+            updated_by: adminId,
+            updated_at: new Date().toISOString(),
+          },
+          { onConflict: 'key' },
+        )
+        .select('*')
+        .single();
+      if (error) throw new ApiError(500, 'Failed to update feature flag.');
+      feature = mapFeatureFlag(data);
+    }
+    await writeAdminAudit(adminId, 'CHANGED_FEATURE_FLAG', 'feature_flag', key, {
+      state: feature.state,
+      rolloutPercent: feature.rolloutPercent,
+    });
+    res.json(feature);
   }),
 );
 
