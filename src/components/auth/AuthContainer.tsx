@@ -1,8 +1,21 @@
-import React, { useState } from "react";
+import React, { useEffect, useState } from "react";
 import { Lock, UserPlus, KeyRound, User, ShieldCheck } from "lucide-react";
 import { AuthUser, AuthView } from "../../types";
 import { SignInForm } from "./SignInForm";
 import { SignUpForm } from "./SignUpForm";
+import { ForgotPasswordPanel } from "./ForgotPasswordPanel";
+
+const PATH_BY_VIEW: Partial<Record<AuthView, string>> = {
+  signin: "/login",
+  signup: "/signup",
+  forgot_password: "/forgot-password",
+};
+
+const VIEW_BY_PATH: Record<string, AuthView> = {
+  "/login": "signin",
+  "/signup": "signup",
+  "/forgot-password": "forgot_password",
+};
 
 interface AuthContainerProps {
   onAuthSuccess: (user: AuthUser) => void;
@@ -18,16 +31,28 @@ export const AuthContainer: React.FC<AuthContainerProps> = ({
   const [currentView, setCurrentView] = useState<AuthView>(initialView);
   const [targetIdentifier, setTargetIdentifier] = useState<string>("");
 
+  // Keep the URL in sync without a full page reload, so the tab bar stays
+  // mounted (and stays highlighted) while switching between auth views.
   const handleNavigate = (view: AuthView, identifier?: string) => {
-    if (view === "forgot_password") {
-      window.location.assign(`/forgot-password${identifier ? `?email=${encodeURIComponent(identifier)}` : ""}`);
-      return;
-    }
     setCurrentView(view);
     if (identifier !== undefined) {
       setTargetIdentifier(identifier);
     }
+    const nextPath = PATH_BY_VIEW[view];
+    if (nextPath && window.location.pathname !== nextPath) {
+      window.history.pushState({}, "", nextPath);
+    }
   };
+
+  // Honour the browser back/forward buttons between auth views.
+  useEffect(() => {
+    const syncFromLocation = () => {
+      const view = VIEW_BY_PATH[window.location.pathname];
+      if (view) setCurrentView(view);
+    };
+    window.addEventListener("popstate", syncFromLocation);
+    return () => window.removeEventListener("popstate", syncFromLocation);
+  }, []);
 
   const navItems: { id: AuthView; label: string; icon: React.ReactNode }[] = [
     { id: "signin", label: "Sign In", icon: <Lock size={14} /> },
@@ -117,7 +142,12 @@ export const AuthContainer: React.FC<AuthContainerProps> = ({
             />
           )}
 
-          {currentView === "forgot_password" && <p className="font-bold">Redirecting to password recovery...</p>}
+          {currentView === "forgot_password" && (
+            <ForgotPasswordPanel
+              initialIdentifier={targetIdentifier}
+              onBackToSignIn={() => handleNavigate("signin", targetIdentifier)}
+            />
+          )}
         </div>
 
         {/* Guest continue option for easy testing */}

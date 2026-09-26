@@ -1,15 +1,17 @@
 import React, { useState } from "react";
-import { ArrowRight, CheckCircle2, Eye, EyeOff, Lock, Mail, User } from "lucide-react";
+import { ArrowRight, Eye, EyeOff, Lock, Mail } from "lucide-react";
 import { AuthView } from "../../types";
 import { useAuth } from "../../context/AuthContext";
+import { EmailTakenBlock } from "./EmailTakenBlock";
 
 export function SignUpForm({ onNavigate }: { onSuccess?: unknown; onNavigate: (view: AuthView, identifier?: string) => void }) {
   const { signUp, authError, clearAuthError } = useAuth();
-  const [email, setEmail] = useState(""); const [password, setPassword] = useState(""); const [confirm, setConfirm] = useState(""); const [name, setName] = useState(""); const [showPassword, setShowPassword] = useState(false); const [loading, setLoading] = useState(false); const [error, setError] = useState(""); const [confirmation, setConfirmation] = useState(false);
+  const [email, setEmail] = useState(""); const [password, setPassword] = useState(""); const [confirm, setConfirm] = useState(""); const [name, setName] = useState(""); const [showPassword, setShowPassword] = useState(false); const [loading, setLoading] = useState(false); const [error, setError] = useState(""); const [confirmation, setConfirmation] = useState(false); const [emailTaken, setEmailTaken] = useState("");
 
   const submit = async (event: React.FormEvent) => {
     event.preventDefault();
     setError("");
+    setEmailTaken("");
     clearAuthError();
     if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) return setError("Enter a valid email address.");
     if (password.length < 6) return setError("Password must be at least 6 characters.");
@@ -17,7 +19,8 @@ export function SignUpForm({ onNavigate }: { onSuccess?: unknown; onNavigate: (v
     setLoading(true);
     const result = await signUp(email, password, { display_name: name.trim() });
     setLoading(false);
-    if (result.error) setError(result.error);
+    if (result.emailTaken) setEmailTaken(email.trim().toLowerCase());
+    else if (result.error) setError(result.error);
     else if (result.needsEmailConfirmation) setConfirmation(true);
     else window.location.replace("/dashboard");
   };
@@ -50,7 +53,7 @@ export function SignUpForm({ onNavigate }: { onSuccess?: unknown; onNavigate: (v
           <input
             type="email"
             value={email}
-            onChange={(e) => setEmail(e.target.value)}
+            onChange={(e) => { setEmail(e.target.value); if (emailTaken) setEmailTaken(""); }}
             autoComplete="email"
             placeholder="you@example.com"
             className="w-full pl-10 pr-3 py-3 bg-white border-[2.5px] border-black rounded-xl text-[15px] font-bold text-[#111] placeholder:text-[#777] outline-none focus:ring-2 focus:ring-[#FFE066]"
@@ -72,8 +75,8 @@ export function SignUpForm({ onNavigate }: { onSuccess?: unknown; onNavigate: (v
               placeholder="At least 6 chars"
               className="w-full pl-10 pr-10 py-3 bg-white border-[2.5px] border-black rounded-xl text-[15px] font-bold text-[#111] placeholder:text-[#777] outline-none focus:ring-2 focus:ring-[#FFE066]"
             />
-            <button type="button" onClick={() => setShowPassword((value) => !value)} className="absolute right-3 top-3.5" aria-label="Toggle password">
-              <Eye size={17} />
+            <button type="button" onClick={() => setShowPassword((value) => !value)} className="absolute right-3 top-3.5" aria-label={showPassword ? "Hide password" : "Show password"}>
+              {showPassword ? <EyeOff size={17} /> : <Eye size={17} />}
             </button>
           </div>
         </label>
@@ -92,7 +95,15 @@ export function SignUpForm({ onNavigate }: { onSuccess?: unknown; onNavigate: (v
 
       </div>
 
-      {(error || authError) && <div className="bg-[#FDA4AF] border-[2px] border-black rounded-xl p-3 font-bold text-sm">{error || authError}</div>}
+      {emailTaken && (
+        <EmailTakenBlock
+          email={emailTaken}
+          onSignIn={() => onNavigate("signin", emailTaken)}
+          onDismiss={() => setEmailTaken("")}
+        />
+      )}
+
+      {(error || authError) && !emailTaken && <div className="bg-[#FDA4AF] border-[2px] border-black rounded-xl p-3 font-bold text-sm">{error || authError}</div>}
 
       <button disabled={loading} className="w-full h-12 bg-[#FFE066] border-[2.5px] border-black text-black rounded-xl font-black uppercase flex items-center justify-center gap-2 brutal-shadow disabled:opacity-50">
         {loading ? "Creating account..." : <>Create account <ArrowRight size={18} /></>}
