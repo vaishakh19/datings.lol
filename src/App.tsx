@@ -33,7 +33,7 @@ const PUBLIC_AUTH_PATHS = new Set(["/", "/login", "/signup", "/forgot-password"]
 /** Supabase redirect targets that must never be rewritten to /login. */
 const AUTH_CALLBACK_PATHS = new Set(["/auth/callback", "/auth/reset-password"]);
 import { useAuth } from "./context/AuthContext";
-import { getTodayHotTake } from "./data/hotTakes";
+import { getTodayHotTake, HotTake } from "./data/hotTakes";
 import {
   cacheUserAppState,
   createDefaultCommunityState,
@@ -827,7 +827,11 @@ export default function App() {
   };
 
   const activeAdminNotification = getActiveAdminNotification(adminSettings);
-  const todayHotTake = adminSettings.dailyHotTake || getTodayHotTake();
+  // An admin override only carries editorial fields; repackage it as a full
+  // HotTake so every consumer (modal, voting, XP) keeps its shape.
+  const todayHotTake: HotTake = adminSettings.dailyHotTake
+    ? { id: "admin-daily-hot-take", bonusXp: 25, ...adminSettings.dailyHotTake }
+    : getTodayHotTake();
   const shouldShowAdminNotification =
     activeAdminNotification && !dismissedNotificationIds.includes(activeAdminNotification.id);
 

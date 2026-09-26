@@ -166,6 +166,22 @@ function getInitials(name: string): string {
     .join("") || "U";
 }
 
+/** The editor seeds itself with today's static hot take when no override is published. */
+function fallbackAdminHotTake(): AdminHotTakeOverride {
+  const daily = getTodayHotTake();
+  return {
+    topic: daily.topic,
+    statement: daily.statement,
+    subtext: daily.subtext,
+    agreePercent: daily.agreePercent,
+    disagreePercent: daily.disagreePercent,
+    complicatedPercent: daily.complicatedPercent,
+    coachInsight: daily.coachInsight,
+    bonusXp: daily.bonusXp,
+    updatedAt: new Date(0).toISOString(),
+  };
+}
+
 export const AdminTab: React.FC<AdminTabProps> = ({
   settings,
   onSaveSettings,
@@ -194,6 +210,13 @@ export const AdminTab: React.FC<AdminTabProps> = ({
     setError("");
     try {
       const [nextOverview, nextUsers] = await Promise.all([getAdminOverview(), getAdminUsers()]);
+      if (!nextOverview?.metrics || !Array.isArray(nextUsers)) {
+        throw new AdminApiError(
+          "The admin API returned an unexpected response. Verify the deployment is up to date.",
+          502,
+          "INVALID_ADMIN_PAYLOAD",
+        );
+      }
       setOverview(nextOverview);
       setUsers(nextUsers);
     } catch (loadError) {
@@ -761,11 +784,11 @@ function UserActions({ user, busy, onPlanChange, onReset, mobile = false }: { us
 
 function ContentSection({ overview, settings, actionKey, runAction, onOverviewChange, onSaveSettings }: { overview: AdminOverviewData; settings: AdminSettings; actionKey: string; runAction: (key: string, action: () => Promise<void>, success: string) => Promise<void>; onOverviewChange: React.Dispatch<React.SetStateAction<AdminOverviewData | null>>; onSaveSettings: (settings: AdminSettings) => void }) {
   const [config, setConfig] = useState<AdminDailyConfig>(overview.dailyConfig);
-  const [hotTake, setHotTake] = useState<AdminHotTakeOverride>(overview.dailyHotTake || getTodayHotTake());
+  const [hotTake, setHotTake] = useState<AdminHotTakeOverride>(overview.dailyHotTake || fallbackAdminHotTake());
   const [tab, setTab] = useState<"mission" | "hot-take">("mission");
 
   useEffect(() => setConfig(overview.dailyConfig), [overview.dailyConfig]);
-  useEffect(() => setHotTake(overview.dailyHotTake || getTodayHotTake()), [overview.dailyHotTake]);
+  useEffect(() => setHotTake(overview.dailyHotTake || fallbackAdminHotTake()), [overview.dailyHotTake]);
 
   const saveMission = async (event: React.FormEvent) => {
     event.preventDefault();
@@ -906,7 +929,7 @@ function AuditRow({ audit, compact = false }: { audit: AdminAuditEntry; compact?
   return <div className={`${compact ? "px-4 sm:px-5 py-3" : "px-4 sm:px-5 py-4"} flex items-start gap-3 hover:bg-[#FBFCF7]`}><div className="w-8 h-8 rounded-lg bg-[#F0F2EA] grid place-items-center shrink-0"><Icon size={13} /></div><div className="min-w-0 flex-1"><div className="text-[10px] font-black">{humanize(audit.action)}</div><div className="text-[8px] font-medium text-black/38 mt-1 truncate">{humanize(audit.targetType)} · {audit.targetId}{audit.actorId ? ` · by ${audit.actorId.slice(0, 8)}` : ""}</div></div><div className="text-[8px] font-bold text-black/30 shrink-0">{formatRelative(audit.createdAt)}</div></div>;
 }
 
-function QuickAction({ icon: Icon, label, onClick }: { icon: React.ComponentType<{ size?: number }>; label: string; onClick: () => void }) {
+function QuickAction({ icon: Icon, label, onClick }: { icon: React.ComponentType<{ size?: number; className?: string }>; label: string; onClick: () => void }) {
   return <button type="button" onClick={onClick} className="w-full rounded-xl border border-white/10 bg-white/[0.055] px-3.5 py-3 flex items-center gap-3 text-[10px] font-black hover:bg-white/[0.09] transition-colors"><Icon size={14} className="text-[#DFFF4F]" />{label}<ArrowRight size={12} className="ml-auto text-white/25" /></button>;
 }
 
