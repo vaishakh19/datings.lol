@@ -1,5 +1,18 @@
 import React, { useState, useEffect, useRef } from "react";
-import { UserProfile, UserProgress, ChatMessage, AuthUser, AuthView, AdminSettings, AppTab } from "./types";
+import {
+  UserProfile,
+  UserProgress,
+  ChatMessage,
+  AuthUser,
+  AuthView,
+  AdminSettings,
+  AppTab,
+  CoachFeedback,
+  CommunityUserState,
+  PrivateJournalEntry,
+  ProfileAuditReport,
+  UserAppState,
+} from "./types";
 import { LESSONS } from "./data/lessons";
 import { Onboarding } from "./components/Onboarding";
 import { Header } from "./components/Header";
@@ -23,15 +36,20 @@ const AUTH_CALLBACK_PATHS = new Set(["/auth/callback", "/auth/reset-password"]);
 import { useAuth } from "./context/AuthContext";
 import { getTodayHotTake } from "./data/hotTakes";
 import {
-  getCurrentUser,
-  setCurrentUser as saveCurrentUser,
-  updateCurrentUserData,
-} from "./utils/authStorage";
+  cacheUserAppState,
+  createDefaultCommunityState,
+  createDefaultUserAppState,
+  createEmptyProgress,
+  loadUserAppState,
+  readCachedUserAppState,
+  readLegacyUserAppState,
+  saveUserAppState,
+} from "./lib/userState";
 import {
   getActiveAdminNotification,
   getAdminSettings,
   isAdminUser,
-  saveAdminSettings, 
+  saveAdminSettings,
 } from "./utils/adminStorage";
 
 const MAX_FREE_CHATS = 3;
@@ -41,7 +59,13 @@ function getTodayStr(): string {
 }
 
 export default function App() {
-  const { user: supabaseUser, session, loading: authLoading, signOut: supabaseSignOut } = useAuth();
+  const {
+    user: supabaseUser,
+    session,
+    loading: authLoading,
+    signOut: supabaseSignOut,
+    updatePassword,
+  } = useAuth();
   const [currentUser, setCurrentUser] = useState<AuthUser | null>(null);
   const [isGuest, setIsGuest] = useState(false);
   const [showAuthView, setShowAuthView] = useState<AuthView | null>(null);
@@ -61,25 +85,8 @@ export default function App() {
     return () => window.removeEventListener("popstate", syncPath);
   }, []);
 
-  const [profile, setProfile] = useState<UserProfile | null>(() => {
-    const user = getCurrentUser();
-    return user?.profile || null;
-  });
-  const [progress, setProgress] = useState<UserProgress>(() => {
-    const user = getCurrentUser();
-    return (
-      user?.progress || {
-        xp: 0,
-        streak: 0,
-        lastCompletedDate: null,
-        completedDates: [],
-        currentDay: 0,
-        journal: [],
-        badges: [],
-        lessonsViewed: [],
-      }
-    );
-  });
+  const [profile, setProfile] = useState<UserProfile | null>(null);
+  const [progress, setProgress] = useState<UserProgress>(() => createEmptyProgress());
 
   const [activeTab, setActiveTab] = useState<AppTab>(() => {
     const path = window.location.pathname;
@@ -90,33 +97,33 @@ export default function App() {
     return "today";
   });
   const [adminSettings, setAdminSettings] = useState<AdminSettings>(() => getAdminSettings());
-  const [dismissedNotificationIds, setDismissedNotificationIds] = useState<string[]>(() => {
-    try {
-      return JSON.parse(localStorage.getItem("datings_dismissed_notifications") || "[]");
-    } catch {
-      return [];
-    }
-  });
-  const [messages, setMessages] = useState<ChatMessage[]>([
-    {
-      id: "1",
-      role: "coach",
-      text: "yo, i'm your coach. paste your chat, or tell me what happened 👁️",
-      time: "now",
-      options: [
-        "Roast my chat",
-        "What do I text back?",
-        "Profile review",
-        "I'm nervous",
-      ],
-    },
-  ]);
+  const [dismissedNotificationIds, setDismissedNotificationIds] = useState<string[]>([]);
+  const [messages, setMessages] = useState<ChatMessage[]>(
+    () => createDefaultUserAppState().messages,
+  );
 
   const [avatarUrl, setAvatarUrl] = useState<string | null>(null);
   const [screenshots, setScreenshots] = useState<string[]>([]);
   const [isPro, setIsPro] = useState(false);
   const [chatsUsedToday, setChatsUsedToday] = useState(0);
   const [lastChatDate, setLastChatDate] = useState<string>("");
+  const [lastHotTakeDate, setLastHotTakeDate] = useState("");
+  const [awardedXpKeys, setAwardedXpKeys] = useState<string[]>([]);
+  const [coachFeedback, setCoachFeedback] = useState<CoachFeedback[]>([]);
+  const [coachMode, setCoachMode] = useState<"gentle" | "direct" | "brutal">("direct");
+  const [communityState, setCommunityState] = useState<CommunityUserState>(
+    () => createDefaultCommunityState(),
+  );
+  const [privateJournal, setPrivateJournal] = useState<PrivateJournalEntry[]>([]);
+  const [profileAudit, setProfileAudit] = useState<ProfileAuditReport | null>(null);
+  const [syncStatus, setSyncStatus] = useState<"loading" | "synced" | "saving" | "offline">(
+    "loading",
+  );
+  const [syncError, setSyncError] = useState("");
+  const hydratedUserIdRef = useRef<string | null>(null);
+  const latestStateRef = useRef<UserAppState>(createDefaultUserAppState());
+  const saveTimerRef = useRef<number | null>(null);
+  const saveQueueRef = useRef<Promise<void>>(Promise.resolve());
   const [showProModal, setShowProModal] = useState(false);
   const [showConfetti, setShowConfetti] = useState(false);
   const [isDayCompleted, setIsDayCompleted] = useState(false);
@@ -162,115 +169,223 @@ export default function App() {
     };
   }, []);
 
-  // Load local storage on mount
-  useEffect(() => {
-    const savedProfile = localStorage.getItem("datings_profile");
-    const savedProgress = localStorage.getItem("datings_progress");
-    const savedChat = localStorage.getItem("datings_chat");
-    const savedIsPro = localStorage.getItem("datings_isPro");
-    const savedChatCount = localStorage.getItem("datings_chatCountToday");
-    const savedLastChatDate = localStorage.getItem("datings_lastChatDate");
-    const savedAvatar = localStorage.getItem("datings_avatar");
-    const savedScreenshots = localStorage.getItem("datings_screenshots");
+  const applyUserState = (state: UserAppState) => {
+    const today = getTodayStr();
+    const nextState = {
+      ...state,
+      chatsUsedToday: state.lastChatDate === today ? state.chatsUsedToday : 0,
+      lastChatDate: today,
+    };
 
-    if (savedProfile) {
-      try { setProfile(JSON.parse(savedProfile)); } catch {}
+    setProfile(nextState.profile);
+    setProgress(nextState.progress);
+    setMessages(nextState.messages);
+    setAvatarUrl(nextState.avatarUrl);
+    setScreenshots(nextState.screenshots);
+    setIsPro(nextState.isPro);
+    setChatsUsedToday(nextState.chatsUsedToday);
+    setLastChatDate(nextState.lastChatDate);
+    setLastHotTakeDate(nextState.lastHotTakeDate);
+    setDismissedNotificationIds(nextState.dismissedNotificationIds);
+    setAwardedXpKeys(nextState.awardedXpKeys);
+    setCoachFeedback(nextState.coachFeedback);
+    setCoachMode(nextState.coachMode);
+    setCommunityState(nextState.community);
+    setPrivateJournal(nextState.privateJournal);
+    setProfileAudit(nextState.profileAudit);
+    setIsDayCompleted(
+      nextState.progress.lastCompletedDate === new Date().toDateString(),
+    );
+    latestStateRef.current = nextState;
+  };
+
+  const persistUserState = (userId: string, state: UserAppState): Promise<void> => {
+    const task = saveQueueRef.current
+      .catch(() => undefined)
+      .then(() => saveUserAppState(userId, state));
+    saveQueueRef.current = task;
+    return task;
+  };
+
+  // Supabase is the source of truth. A per-user browser cache is only used if
+  // the device is offline, and pre-cloud local data is imported once.
+  useEffect(() => {
+    const userId = supabaseUser?.id;
+    if (!userId) {
+      hydratedUserIdRef.current = null;
+      setSyncStatus("loading");
+      return;
     }
 
-    if (savedProgress) {
+    let cancelled = false;
+    hydratedUserIdRef.current = null;
+    setSyncStatus("loading");
+    setSyncError("");
+
+    const hydrate = async () => {
       try {
-        const prog = JSON.parse(savedProgress);
-        setProgress(prog);
-        const todayStr = new Date().toDateString();
-        if (prog.lastCompletedDate === todayStr) {
-          setIsDayCompleted(true);
+        const remoteState = await loadUserAppState(userId);
+        if (cancelled) return;
+
+        const state =
+          remoteState ||
+          readCachedUserAppState(userId) ||
+          readLegacyUserAppState(userId) ||
+          createDefaultUserAppState();
+
+        applyUserState(state);
+        cacheUserAppState(userId, state);
+        hydratedUserIdRef.current = userId;
+        setSyncStatus(remoteState ? "synced" : "saving");
+
+        if (!remoteState) {
+          await persistUserState(userId, state);
+          if (!cancelled) setSyncStatus("synced");
         }
-      } catch {}
-    }
-
-    if (savedChat) {
-      try { setMessages(JSON.parse(savedChat)); } catch {}
-    }
-
-    if (savedAvatar) setAvatarUrl(savedAvatar);
-
-    if (savedScreenshots) {
-      try { setScreenshots(JSON.parse(savedScreenshots)); } catch {}
-    }
-
-    if (savedIsPro) setIsPro(savedIsPro === "true");
-
-    const todayDate = getTodayStr();
-    if (savedLastChatDate) {
-      setLastChatDate(savedLastChatDate);
-      if (savedLastChatDate !== todayDate) {
-        setChatsUsedToday(0);
-        setLastChatDate(todayDate);
-        localStorage.setItem("datings_chatCountToday", "0");
-        localStorage.setItem("datings_lastChatDate", todayDate);
-      } else if (savedChatCount) {
-        setChatsUsedToday(parseInt(savedChatCount, 10) || 0);
+      } catch (error) {
+        if (cancelled) return;
+        const fallback =
+          readCachedUserAppState(userId) ||
+          readLegacyUserAppState(userId) ||
+          createDefaultUserAppState();
+        applyUserState(fallback);
+        hydratedUserIdRef.current = userId;
+        setSyncStatus("offline");
+        setSyncError(
+          error instanceof Error ? error.message : "Cloud sync is temporarily unavailable.",
+        );
       }
-    } else {
-      setLastChatDate(todayDate);
-      localStorage.setItem("datings_lastChatDate", todayDate);
-      localStorage.setItem("datings_chatCountToday", "0");
-    }
+    };
 
-    // Trigger daily hot take once per day upon opening if user has completed onboarding
-    const savedLastHotTakeDate = localStorage.getItem("datings_last_hottake_date");
-    if (savedProfile && savedLastHotTakeDate !== todayDate) {
-      setTimeout(() => {
-        setShowHotTakeModal(true);
-      }, 750);
-    }
-  }, []);
+    void hydrate();
+    return () => {
+      cancelled = true;
+    };
+  }, [supabaseUser?.id]);
 
-  // Save states on updates
+  // Keep a fast per-user cache and debounce writes into one ordered Supabase
+  // upsert. Ordering prevents an older request from overwriting a newer state.
   useEffect(() => {
-    if (profile) localStorage.setItem("datings_profile", JSON.stringify(profile));
-  }, [profile]);
+    const userId = supabaseUser?.id;
+    const state: UserAppState = {
+      version: 1,
+      profile,
+      progress,
+      messages,
+      avatarUrl,
+      screenshots,
+      isPro,
+      chatsUsedToday,
+      lastChatDate,
+      lastHotTakeDate,
+      dismissedNotificationIds,
+      awardedXpKeys,
+      coachFeedback,
+      coachMode,
+      community: communityState,
+      privateJournal,
+      profileAudit,
+    };
+    latestStateRef.current = state;
+
+    if (!userId || hydratedUserIdRef.current !== userId) return;
+    cacheUserAppState(userId, state);
+    if (saveTimerRef.current !== null) window.clearTimeout(saveTimerRef.current);
+    setSyncStatus((status) => (status === "loading" ? status : "saving"));
+
+    saveTimerRef.current = window.setTimeout(() => {
+      saveTimerRef.current = null;
+      void persistUserState(userId, latestStateRef.current)
+        .then(() => {
+          if (hydratedUserIdRef.current === userId) {
+            setSyncStatus("synced");
+            setSyncError("");
+          }
+        })
+        .catch((error) => {
+          if (hydratedUserIdRef.current === userId) {
+            setSyncStatus("offline");
+            setSyncError(
+              error instanceof Error ? error.message : "Cloud sync is temporarily unavailable.",
+            );
+          }
+        });
+    }, 500);
+
+    return () => {
+      if (saveTimerRef.current !== null) {
+        window.clearTimeout(saveTimerRef.current);
+        saveTimerRef.current = null;
+      }
+    };
+  }, [
+    supabaseUser?.id,
+    profile,
+    progress,
+    messages,
+    avatarUrl,
+    screenshots,
+    isPro,
+    chatsUsedToday,
+    lastChatDate,
+    lastHotTakeDate,
+    dismissedNotificationIds,
+    awardedXpKeys,
+    coachFeedback,
+    coachMode,
+    communityState,
+    privateJournal,
+    profileAudit,
+  ]);
+
+  // Flush the newest state when the page is backgrounded so mobile tab
+  // suspension does not lose the last action.
+  useEffect(() => {
+    const flush = () => {
+      const userId = supabaseUser?.id;
+      if (
+        document.visibilityState !== "hidden" ||
+        !userId ||
+        hydratedUserIdRef.current !== userId
+      ) {
+        return;
+      }
+      if (saveTimerRef.current !== null) {
+        window.clearTimeout(saveTimerRef.current);
+        saveTimerRef.current = null;
+      }
+      void persistUserState(userId, latestStateRef.current).catch(() => undefined);
+    };
+    document.addEventListener("visibilitychange", flush);
+    return () => document.removeEventListener("visibilitychange", flush);
+  }, [supabaseUser?.id]);
 
   useEffect(() => {
-    localStorage.setItem("datings_progress", JSON.stringify(progress));
-  }, [progress]);
+    if (syncStatus !== "offline" || !supabaseUser?.id) return;
+    const userId = supabaseUser.id;
+    let retrying = false;
+    const retry = async () => {
+      if (retrying || hydratedUserIdRef.current !== userId) return;
+      retrying = true;
+      try {
+        await persistUserState(userId, latestStateRef.current);
+        setSyncStatus("synced");
+        setSyncError("");
+      } catch {
+        // Keep the local cache and try again while this session remains open.
+      } finally {
+        retrying = false;
+      }
+    };
+    const timer = window.setInterval(() => void retry(), 15_000);
+    return () => window.clearInterval(timer);
+  }, [supabaseUser?.id, syncStatus]);
 
   useEffect(() => {
-    localStorage.setItem("datings_chat", JSON.stringify(messages));
-  }, [messages]);
-
-  useEffect(() => {
-    if (avatarUrl) localStorage.setItem("datings_avatar", avatarUrl);
-  }, [avatarUrl]);
-
-  useEffect(() => {
-    localStorage.setItem("datings_screenshots", JSON.stringify(screenshots));
-  }, [screenshots]);
-
-  useEffect(() => {
-    localStorage.setItem("datings_isPro", String(isPro));
-  }, [isPro]);
-
-  useEffect(() => {
-    localStorage.setItem("datings_chatCountToday", String(chatsUsedToday));
-  }, [chatsUsedToday]);
-
-  useEffect(() => {
-    if (lastChatDate) localStorage.setItem("datings_lastChatDate", lastChatDate);
-  }, [lastChatDate]);
-
-  // Keep active user's profile and progress synchronized in authStorage
-  useEffect(() => {
-    if (currentUser) {
-      updateCurrentUserData({
-        profile: profile || undefined,
-        progress: progress,
-        avatarUrl: avatarUrl || undefined,
-        isPro: isPro,
-        messages,
-      });
-    }
-  }, [currentUser, profile, progress, avatarUrl, isPro, messages]);
+    if (syncStatus === "loading" || !profile || lastHotTakeDate === getTodayStr()) return;
+    const timer = window.setTimeout(() => setShowHotTakeModal(true), 750);
+    return () => window.clearTimeout(timer);
+  }, [lastHotTakeDate, profile, syncStatus]);
 
   const adminAllowed = isAdminUser(currentUser);
 
@@ -329,41 +444,27 @@ export default function App() {
   };
 
   const handleAuthSuccess = (user: AuthUser) => {
+    // Supabase's auth event performs the real hydration. This callback remains
+    // for the modal contract and never treats browser storage as account data.
     setCurrentUser(user);
-    saveCurrentUser(user);
     setIsGuest(false);
     setShowAuthView(null);
-
-    if (user.profile) {
-      setProfile(user.profile);
-    } else {
-      setProfile({
-        goal: "dates",
-        blocker: "overthink",
-        experience: "some",
-        vibe: "roasty",
-        startedAt: new Date().toISOString(),
-      });
-    }
-
-    if (user.progress) {
-      setProgress(user.progress);
-      const todayStr = new Date().toDateString();
-      if (user.progress.lastCompletedDate === todayStr) {
-        setIsDayCompleted(true);
-      }
-    }
-
-    if (user.avatarUrl) setAvatarUrl(user.avatarUrl);
-    if (user.isPro !== undefined) setIsPro(user.isPro);
-
-    setShowConfetti(true);
-    setTimeout(() => setShowConfetti(false), 2500);
   };
 
-  const handleSignOut = () => {
-    void supabaseSignOut();
-    saveCurrentUser(null);
+  const handleSignOut = async () => {
+    const userId = supabaseUser?.id;
+    if (userId && hydratedUserIdRef.current === userId) {
+      if (saveTimerRef.current !== null) {
+        window.clearTimeout(saveTimerRef.current);
+        saveTimerRef.current = null;
+      }
+      try {
+        await persistUserState(userId, latestStateRef.current);
+      } catch {
+        // The per-user cache will be retried the next time this account signs in.
+      }
+    }
+    await supabaseSignOut();
     setIsGuest(false);
     setShowAuthView(null);
   };
@@ -392,39 +493,20 @@ export default function App() {
 
   const handleOnboardingComplete = (newProfile: UserProfile) => {
     setProfile(newProfile);
-    if (currentUser) {
-      updateCurrentUserData({ profile: newProfile });
-    }
-    const savedLastHotTakeDate = localStorage.getItem("datings_last_hottake_date");
-    if (savedLastHotTakeDate !== getTodayStr()) {
-      setTimeout(() => {
-        setShowHotTakeModal(true);
-      }, 800);
+    if (lastHotTakeDate !== getTodayStr()) {
+      setTimeout(() => setShowHotTakeModal(true), 800);
     }
   };
 
-  const handleVoteHotTake = (reaction: "agree" | "disagree" | "complicated", xpReward: number) => {
-    const todayDate = getTodayStr();
-    localStorage.setItem("datings_last_hottake_date", todayDate);
-
-    // Award bonus XP to progress
-    setProgress((prev) => {
-      const updatedXp = prev.xp + xpReward;
-      const updated = {
-        ...prev,
-        xp: updatedXp,
-      };
-      localStorage.setItem("datings_progress", JSON.stringify(updated));
-      return updated;
-    });
-
+  const handleVoteHotTake = (_reaction: "agree" | "disagree" | "complicated", xpReward: number) => {
+    setLastHotTakeDate(getTodayStr());
+    setProgress((previous) => ({ ...previous, xp: previous.xp + xpReward }));
     setShowConfetti(true);
     setTimeout(() => setShowConfetti(false), 2500);
   };
 
   const handleCloseHotTakeModal = () => {
-    const todayDate = getTodayStr();
-    localStorage.setItem("datings_last_hottake_date", todayDate);
+    setLastHotTakeDate(getTodayStr());
     setShowHotTakeModal(false);
   };
 
@@ -496,9 +578,9 @@ export default function App() {
   };
 
   const handleCommunityXp = (amount: number, reason: string) => {
-    const transactionKey = `datings_community_xp_${getTodayStr()}_${reason}`;
-    if (localStorage.getItem(transactionKey)) return;
-    localStorage.setItem(transactionKey, "1");
+    const transactionKey = `${getTodayStr()}_${reason}`;
+    if (awardedXpKeys.includes(transactionKey)) return;
+    setAwardedXpKeys((previous) => [...previous, transactionKey].slice(-250));
     setProgress((previous) => ({
       ...previous,
       xp: previous.xp + amount,
@@ -531,7 +613,6 @@ export default function App() {
 
   const handleUpdateProfile = (nextProfile: UserProfile) => {
     setProfile(nextProfile);
-    if (currentUser) updateCurrentUserData({ profile: nextProfile });
   };
 
   const handlePracticeComplete = (scenario: string, score: number) => {
@@ -552,11 +633,7 @@ export default function App() {
   };
 
   const handleUpdateDailyFocus = (focus: string) => {
-    setProgress((prev) => {
-      const updated = { ...prev, dailyFocus: focus };
-      localStorage.setItem("datings_progress", JSON.stringify(updated));
-      return updated;
-    });
+    setProgress((previous) => ({ ...previous, dailyFocus: focus }));
   };
 
   const handleNewCoachSession = () => {
@@ -565,10 +642,8 @@ export default function App() {
   };
 
   const handleCoachMessageFeedback = (messageId: string, helpful: boolean) => {
-    const feedback = JSON.parse(localStorage.getItem("datings_coach_feedback") || "[]");
-    localStorage.setItem(
-      "datings_coach_feedback",
-      JSON.stringify([...feedback, { messageId, helpful, createdAt: new Date().toISOString() }].slice(-100))
+    setCoachFeedback((previous) =>
+      [...previous, { messageId, helpful, createdAt: new Date().toISOString() }].slice(-100),
     );
   };
 
@@ -662,42 +737,13 @@ export default function App() {
   };
 
   const handleResetData = () => {
-    localStorage.clear();
-    setProfile(null);
-    setProgress({
-      xp: 0,
-      streak: 0,
-      lastCompletedDate: null,
-      completedDates: [],
-      currentDay: 0,
-      journal: [],
-      badges: [],
-      lessonsViewed: [],
-      dailyFocus: "",
-    });
+    const reset = createDefaultUserAppState();
+    reset.lastChatDate = getTodayStr();
+    applyUserState(reset);
     setActiveTab("today");
     setIsDayCompleted(false);
-    setIsPro(false);
-    setChatsUsedToday(0);
-    setLastChatDate(getTodayStr());
     setShowProModal(false);
     setShowHotTakeModal(false);
-    setAvatarUrl(null);
-    setScreenshots([]);
-    setMessages([
-      {
-        id: "1",
-        role: "coach",
-        text: "yo, i'm your coach. paste your chat, or tell me what happened 👁️",
-        time: "now",
-        options: [
-          "Roast my chat",
-          "What do I text back?",
-          "Profile review",
-          "I'm nervous",
-        ],
-      },
-    ]);
   };
 
   const handleSaveAdminSettings = (settings: AdminSettings) => {
@@ -712,9 +758,9 @@ export default function App() {
 
   const handleDismissAdminNotification = () => {
     if (!activeAdminNotification) return;
-    const nextDismissedIds = [...new Set([...dismissedNotificationIds, activeAdminNotification.id])];
-    setDismissedNotificationIds(nextDismissedIds);
-    localStorage.setItem("datings_dismissed_notifications", JSON.stringify(nextDismissedIds));
+    setDismissedNotificationIds((previous) => [
+      ...new Set([...previous, activeAdminNotification.id]),
+    ]);
   };
 
   const handleUpgradeToPro = () => {
@@ -763,6 +809,16 @@ export default function App() {
 
   // Signed-in users can still reach the standalone recovery page directly.
   if (pathname === "/forgot-password") return <ForgotPasswordPage />;
+
+  if (supabaseUser && syncStatus === "loading") {
+    return (
+      <div className="min-h-screen bg-[#FFFBEB] flex flex-col items-center justify-center gap-3 px-6 text-center">
+        <div className="w-12 h-12 rounded-full border-[4px] border-black border-t-[#FFE066] animate-spin" />
+        <div className="font-black text-lg">SYNCING YOUR PROFILE…</div>
+        <p className="font-bold text-sm opacity-60">Loading your XP, streak, chats, and settings.</p>
+      </div>
+    );
+  }
 
   if (!profile) {
     return <Onboarding onComplete={handleOnboardingComplete} />;
@@ -827,7 +883,6 @@ export default function App() {
             <AuthContainer
               onAuthSuccess={handleAuthSuccess}
               initialView={showAuthView}
-              onClose={() => setShowAuthView(null)}
             />
           </div>
         </div>
@@ -846,6 +901,16 @@ export default function App() {
 
       {/* Main Tab Content */}
       <main className="max-w-[640px] mx-auto px-4 pb-[100px] pt-6">
+        {syncStatus === "offline" && (
+          <div className="mb-5 bg-[#FDA4AF] border-[3px] border-black rounded-[18px] p-3 brutal-shadow-sm">
+            <div className="font-black text-[12px] uppercase">Cloud sync paused</div>
+            <p className="font-bold text-[11px] mt-1">
+              Your latest changes are cached on this device and will sync after the database is reachable.
+            </p>
+            {syncError && <p className="text-[9px] mt-1 opacity-60 break-words">{syncError}</p>}
+          </div>
+        )}
+
         {shouldShowAdminNotification && activeAdminNotification && (
           <div className="mb-5 bg-white border-[3px] border-black rounded-[20px] p-4 brutal-shadow-sm animate-[pop_0.25s_ease-out]">
             <div className="flex items-start justify-between gap-3">
@@ -914,6 +979,8 @@ export default function App() {
             onNewSession={handleNewCoachSession}
             onMessageFeedback={handleCoachMessageFeedback}
             isTyping={isTyping}
+            savedMode={coachMode}
+            onModeChange={setCoachMode}
           />
         )}
 
@@ -928,6 +995,8 @@ export default function App() {
             onOpenCoach={handleOpenCoachContext}
             onPracticeToday={handlePracticeToday}
             onAwardXp={handleCommunityXp}
+            userState={communityState}
+            onUserStateChange={setCommunityState}
           />
         )}
 
@@ -956,6 +1025,15 @@ export default function App() {
             currentUser={currentUser}
             onSignOut={handleSignOut}
             onOpenAuth={handleOpenAuth}
+            privateJournal={privateJournal}
+            profileAudit={profileAudit}
+            onPrivateDataChange={(journal, audit) => {
+              setPrivateJournal(journal);
+              setProfileAudit(audit);
+            }}
+            syncStatus={syncStatus}
+            syncError={syncError}
+            onUpdatePassword={updatePassword}
           />
         )}
 

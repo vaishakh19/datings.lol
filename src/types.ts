@@ -89,6 +89,64 @@ export interface UserProgress {
   skillScores?: Record<string, number>;
 }
 
+export type PrivateJournalType =
+  | "date recap"
+  | "rejection"
+  | "confidence"
+  | "lesson learned"
+  | "observation";
+
+export interface PrivateJournalEntry {
+  id: string;
+  title: string;
+  content: string;
+  type: PrivateJournalType;
+  createdAt: string;
+}
+
+export interface ProfileAuditReport {
+  id: string;
+  score: number;
+  createdAt: string;
+  photos: number;
+  personality: number;
+  clarity: number;
+  fix: string;
+}
+
+export interface CommunityUserState {
+  saved: string[];
+  completed: string[];
+  reactions: Record<string, string>;
+}
+
+export interface CoachFeedback {
+  messageId: string;
+  helpful: boolean;
+  createdAt: string;
+}
+
+/** The complete per-account payload synchronized to Supabase. */
+export interface UserAppState {
+  version: number;
+  profile: UserProfile | null;
+  progress: UserProgress;
+  messages: ChatMessage[];
+  avatarUrl: string | null;
+  screenshots: string[];
+  isPro: boolean;
+  chatsUsedToday: number;
+  lastChatDate: string;
+  lastHotTakeDate: string;
+  dismissedNotificationIds: string[];
+  awardedXpKeys: string[];
+  coachFeedback: CoachFeedback[];
+  coachMode: "gentle" | "direct" | "brutal";
+  community: CommunityUserState;
+  privateJournal: PrivateJournalEntry[];
+  profileAudit: ProfileAuditReport | null;
+}
+
 export interface Task {
   title: string;
   desc: string;

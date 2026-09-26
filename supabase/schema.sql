@@ -533,3 +533,21 @@ create policy "users own achievements" on public.user_achievements for select us
 create policy "users own journal" on public.journal_entries for all using (auth.uid() = user_id) with check (auth.uid() = user_id);
 create policy "users own profile uploads" on public.dating_profile_uploads for all using (auth.uid() = user_id) with check (auth.uid() = user_id);
 create policy "users own audits" on public.profile_audits for all using (auth.uid() = user_id) with check (auth.uid() = user_id);
+
+-- Cross-device account state. Keep in sync with
+-- supabase/migrations/20260926000000_user_app_state.sql.
+create table if not exists public.user_app_state (
+  user_id uuid primary key references auth.users(id) on delete cascade,
+  state jsonb not null default '{}'::jsonb,
+  state_version integer not null default 1 check (state_version > 0),
+  created_at timestamptz not null default now(),
+  updated_at timestamptz not null default now(),
+  constraint user_app_state_is_object check (jsonb_typeof(state) = 'object')
+);
+alter table public.user_app_state enable row level security;
+create policy "users read own app state" on public.user_app_state for select to authenticated using ((select auth.uid()) = user_id);
+create policy "users insert own app state" on public.user_app_state for insert to authenticated with check ((select auth.uid()) = user_id);
+create policy "users update own app state" on public.user_app_state for update to authenticated using ((select auth.uid()) = user_id) with check ((select auth.uid()) = user_id);
+create policy "users delete own app state" on public.user_app_state for delete to authenticated using ((select auth.uid()) = user_id);
+grant select, insert, update, delete on public.user_app_state to authenticated;
+revoke all on public.user_app_state from anon;
