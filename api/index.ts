@@ -27,7 +27,13 @@ let handler: Handler | null = null;
 let bootError: string | null = null;
 
 try {
-  const { app } = await import('../server');
+  // The explicit .js extension is required: this package is ESM ("type":
+  // "module"), and Vercel's Node builder transpiles files individually and
+  // copies them as-is instead of bundling. Node's ESM resolver needs the
+  // extension to find the compiled /var/task/server.js at runtime, while
+  // esbuild/tsc map "../server.js" back to ../server.ts at build time.
+  // Extensionless, this import fails with "Cannot find module '/var/task/server'".
+  const { app } = await import('../server.js');
   handler = app as unknown as Handler;
 } catch (error) {
   bootError = error instanceof Error ? `${error.name}: ${error.message}` : String(error);
