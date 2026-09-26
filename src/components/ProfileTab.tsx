@@ -32,7 +32,7 @@ import {
 import { BADGES } from "../data/badges";
 import { getRankInfo } from "../data/lessons";
 import { processUploadFile } from "../utils/imageCompressor";
-import { verifyAndResetPassword } from "../utils/authStorage";
+import { useAuth } from "../context/AuthContext";
 
 interface ProfileTabProps {
   profile: UserProfile;
@@ -150,6 +150,7 @@ export const ProfileTab: React.FC<ProfileTabProps> = ({
   onSignOut,
   onOpenAuth,
 }) => {
+  const { updatePassword } = useAuth();
   const userKey = currentUser?.id || "guest";
 
   const avatarInputRef = useRef<HTMLInputElement>(null);
@@ -445,7 +446,7 @@ export const ProfileTab: React.FC<ProfileTabProps> = ({
     setResetText("");
   };
 
-  const savePassword = (
+  const savePassword = async (
     event: React.FormEvent
   ) => {
     event.preventDefault();
@@ -457,21 +458,9 @@ export const ProfileTab: React.FC<ProfileTabProps> = ({
       return;
     }
 
-    const result = verifyAndResetPassword({
-      identifier: currentUser.username,
-      code: "123456",
-      newPassword,
-    });
-
-    setPasswordMessage(
-      result.success
-        ? "Password updated."
-        : result.error || "Could not update password."
-    );
-
-    if (result.success) {
-      setNewPassword("");
-    }
+    const result = await updatePassword(newPassword);
+    setPasswordMessage(result.error ? result.error : "Password updated.");
+    if (!result.error) setNewPassword("");
   };
 
   const visibleSkills = showAllSkills

@@ -49,7 +49,7 @@ const envSchema = z.object({
   COACH_XP_REWARD: z.coerce.number().int().min(0).max(1000).default(20),
 
   ALLOW_DEMO_MODE: z.enum(['true', 'false']).default('false'),
-  ENABLE_CSP: z.enum(['true', 'false']).default('false'),
+  ENABLE_CSP: z.enum(['true', 'false']).default('true'),
   CORS_ORIGINS: z.string().optional(),
   ADMIN_USER_IDS: z.string().optional(),
   LOG_LEVEL: z.enum(['fatal', 'error', 'warn', 'info', 'debug', 'trace']).default('info'),
@@ -270,12 +270,6 @@ function sb(): SupabaseClient {
   return serviceClient;
 }
 
-interface CachedAuth {
-  userId: string;
-  expiresAt: number;
-}
-const tokenCache = new Map<string, CachedAuth>();
-const TOKEN_CACHE_TTL_MS = 5 * 60 * 1000;
 let warnedDemoAuth = false;
 
 async function getAuthenticatedUserId(req: Request): Promise<string | null> {
@@ -284,26 +278,23 @@ async function getAuthenticatedUserId(req: Request): Promise<string | null> {
   const token = authorization.slice(7).trim();
   if (!token) return null;
 
-  const cacheKey = crypto.createHash('sha256').update(token).digest('hex');
-  const cached = tokenCache.get(cacheKey);
-  if (cached && cached.expiresAt > Date.now()) return cached.userId;
-
   if (SUPABASE_URL && SUPABASE_SERVICE_ROLE_KEY) {
+    // Validate every token with Supabase. Caching access-token validation lets
+    // a signed-out or revoked token continue calling private endpoints.
     const { data, error } = await sb().auth.getUser(token);
     if (error || !data?.user) return null;
-    if (tokenCache.size > 10_000) tokenCache.clear();
-    tokenCache.set(cacheKey, { userId: data.user.id, expiresAt: Date.now() + TOKEN_CACHE_TTL_MS });
     return data.user.id;
   }
 
   // Dev-only convenience when running without Supabase: a stable ID derived
   // from the token hash so authenticated routes work locally.
   if (demoMode) {
+    const demoTokenHash = crypto.createHash('sha256').update(token).digest('hex');
     if (!warnedDemoAuth) {
       warnedDemoAuth = true;
       logger.warn('Demo mode: deriving user IDs from token hash (no Supabase auth).');
     }
-    return `demo-${cacheKey.slice(0, 16)}`;
+    return `demo-${demoTokenHash.slice(0, 16)}`;
   }
   return null;
 }
@@ -883,13 +874,23 @@ function createSupabaseStore(): DataStore {
         };
       },
       async users(search) {
-        const needle = search.toLowerCase();
-        let query = sb().from('profiles').select('id, username, email, xp, streak').limit(500);
-        if (needle) query = query.or(`username.ilike.%${needle}%,email.ilike.%${needle}%`);
-        const [{ data: rows, error }, { data: proRows }] = await Promise.all([
-          query,
+        const needle = search.trim().toLowerCase();
+        // Do not interpolate user input into PostgREST's .or() filter syntax.
+        // Besides wildcard surprises, commas and parentheses can alter the filter.
+        const escapedNeedle = needle.replace(/[\%_]/g, (character) => `\\${character}`);
+        const base = () => sb().from('profiles').select('id, username, email, xp, streak').limit(500);
+        const profileQueries = needle
+          ? [base().ilike('username', `%${escapedNeedle}%`), base().ilike('email', `%${escapedNeedle}%`)]
+          : [base()];
+        const [{ data: firstRows, error: firstError }, { data: secondRows, error: secondError }, { data: proRows }] = await Promise.all([
+          profileQueries[0],
+          profileQueries[1] ?? Promise.resolve({ data: [], error: null }),
           sb().from('subscriptions').select('user_id').eq('status', 'active').eq('plan', 'pro'),
         ]);
+        const error = firstError || secondError;
+        const rows = [...(firstRows ?? []), ...(secondRows ?? [])].filter((row, index, all) =>
+          all.findIndex((candidate) => candidate.id === row.id) === index,
+        );
         if (error) {
           logger.warn({ err: error }, 'admin users query failed');
           return [];
@@ -1006,23 +1007,26 @@ const store: DataStore = demoMode ? createMemoryStore() : createSupabaseStore();
 // ============================================================================
 
 const app = express();
-app.set('trust proxy', 1); // required for correct client IPs behind proxies
+app.set('query parser', 'simple');
+// Trust only the first ingress proxy; rate limiting and secure cookies depend on
+// Express seeing the real client IP without accepting arbitrary forwarded hops.
+app.set('trust proxy', 1);
 app.disable('x-powered-by');
 
 app.use(
   helmet({
-    // CSP is opt-in (ENABLE_CSP=true) so it can be tuned against the real
-    // deployed SPA without risking breakage. Everything else is on by default.
+    // CSP is enabled in production by default and can be disabled temporarily
+    // with ENABLE_CSP=false if a deployment needs further policy tuning.
     contentSecurityPolicy:
-      env.ENABLE_CSP === 'true'
+      isProd && env.ENABLE_CSP === 'true'
         ? {
             directives: {
               defaultSrc: ["'self'"],
               scriptSrc: ["'self'"],
-              styleSrc: ["'self'", "'unsafe-inline'"],
+              styleSrc: ["'self'", "'unsafe-inline'", 'https://fonts.googleapis.com'],
               imgSrc: ["'self'", 'data:', 'blob:'],
               connectSrc: ["'self'", 'https:', 'wss:'],
-              fontSrc: ["'self'", 'data:'],
+              fontSrc: ["'self'", 'data:', 'https://fonts.gstatic.com'],
               objectSrc: ["'none'"],
               frameAncestors: ["'none'"],
             },
@@ -1051,7 +1055,13 @@ app.use((req: Request, res: Response, next: NextFunction) => {
 app.use(
   pinoHttp({
     logger,
-    genReqId: (req) => (req.headers['x-request-id'] as string) || crypto.randomUUID(),
+    genReqId: (req) => {
+      const supplied = req.headers['x-request-id'];
+      // Never put arbitrary header data into logs or response correlation IDs.
+      return typeof supplied === 'string' && /^[A-Za-z0-9._-]{1,100}$/.test(supplied)
+        ? supplied
+        : crypto.randomUUID();
+    },
     autoLogging: { ignore: (req) => req.url === '/healthz' || req.url === '/readyz' },
     serializers: {
       req: (req: any) => ({ id: req.id, method: req.method, url: req.url, userId: req.userId }),
@@ -1622,10 +1632,12 @@ STRICT RULES:
 
       const currentParts: any[] = [];
       if (body.imageBase64) {
-        const cleanedBase64 = body.imageBase64.replace(/^data:image\/\w+;base64,/, '');
-        const mimeMatch = body.imageBase64.match(/^data:(image\/\w+);base64,/);
+        const imageMatch = body.imageBase64.match(/^data:(image\/(?:png|jpeg|webp));base64,([A-Za-z0-9+/=\r\n]+)$/);
+        if (!imageMatch) throw badRequest('Invalid image attachment.');
+        const imageBytes = Buffer.from(imageMatch[2], 'base64');
+        if (!imageBytes.length || imageBytes.length > 5_000_000) throw badRequest('Image attachment is too large.');
         currentParts.push({
-          inlineData: { mimeType: mimeMatch ? mimeMatch[1] : 'image/jpeg', data: cleanedBase64 },
+          inlineData: { mimeType: imageMatch[1], data: imageMatch[2].replace(/\s/g, '') },
         });
       }
       currentParts.push({ text: userText || (hasImage ? 'Roast this chat / profile screenshot and give me actionable fixes.' : 'Give me dating advice.') });
@@ -1704,7 +1716,7 @@ async function startServer() {
     try {
       const { createServer: createViteServer } = await import('vite');
       const vite = await createViteServer({
-        server: { middlewareMode: true },
+        server: { middlewareMode: true, allowedHosts: true },
         appType: 'spa',
       });
       app.use(vite.middlewares);
