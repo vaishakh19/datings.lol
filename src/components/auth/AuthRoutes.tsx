@@ -1,6 +1,7 @@
 import React, { useEffect, useState } from "react";
-import { CheckCircle2, LoaderCircle, MailCheck, TriangleAlert } from "lucide-react";
+import { LoaderCircle, TriangleAlert } from "lucide-react";
 import { useAuth } from "../../context/AuthContext";
+import { ForgotPasswordPanel } from "./ForgotPasswordPanel";
 
 function Shell({ children }: { children: React.ReactNode }) {
   return <div className="min-h-screen bg-[#FFFBEB] text-[#111] flex items-center justify-center p-4"><div className="w-full max-w-[540px] bg-white border-[3px] border-black rounded-3xl p-6 sm:p-8 brutal-shadow">{children}</div></div>;
@@ -24,10 +25,9 @@ export function ResetPasswordPage() {
 }
 
 export function ForgotPasswordPage() {
-  const { resetPassword, authError } = useAuth();
-  const [email, setEmail] = useState("");
-  const [sent, setSent] = useState(false);
-  const [message, setMessage] = useState("");
-  const submit = async (event: React.FormEvent) => { event.preventDefault(); if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) return setMessage("Enter a valid email address."); const result = await resetPassword(email); if (result.error) setMessage(result.error); else setSent(true); };
-  return <Shell>{sent ? <div className="text-center"><MailCheck className="mx-auto text-green-600" size={34} /><h1 className="font-black text-2xl mt-3">CHECK YOUR EMAIL</h1><p className="font-bold opacity-70 mt-2">If an account matches that email, Supabase sent a secure reset link.</p><a href="/login" className="inline-block mt-5 font-black underline">Back to login</a></div> : <><h1 className="font-black text-3xl">FORGOT PASSWORD?</h1><p className="font-bold opacity-60 mt-2">We&apos;ll send a secure reset link. We won&apos;t reveal whether an email is registered.</p><form onSubmit={submit} className="space-y-3 mt-5"><input type="email" value={email} onChange={(e) => setEmail(e.target.value)} placeholder="you@example.com" autoComplete="email" className="w-full h-12 border-[2px] border-black rounded-xl px-3 font-bold text-[#111] placeholder:text-gray-500" /><button className="w-full h-12 bg-[#FFE066] border-[2px] border-black rounded-xl font-black uppercase brutal-shadow-sm">Send reset link</button></form>{(message || authError) && <p className="mt-4 bg-[#FDA4AF] border-[2px] border-black rounded-xl p-3 font-bold text-sm">{message || authError}</p>}<a href="/login" className="inline-block mt-4 font-black underline">Back to login</a></>}</Shell>;
+  return (
+    <Shell>
+      <ForgotPasswordPanel onBackToSignIn={() => window.location.assign("/login")} />
+    </Shell>
+  );
 }

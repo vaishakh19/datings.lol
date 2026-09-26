@@ -694,18 +694,22 @@ export default function App() {
   }
   if (pathname === "/auth/callback") return <AuthCallbackPage />;
   if (pathname === "/auth/reset-password") return <ResetPasswordPage />;
-  if (pathname === "/forgot-password") return <ForgotPasswordPage />;
-
-  const isPublicAuthPath = pathname === "/login" || pathname === "/signup" || pathname === "/";
+  const isPublicAuthPath =
+    pathname === "/login" || pathname === "/signup" || pathname === "/forgot-password" || pathname === "/";
   if (!supabaseUser && !isGuest) {
     if (!isPublicAuthPath) window.history.replaceState({}, "", "/login");
     return (
       <AuthContainer
         onAuthSuccess={handleAuthSuccess}
-        initialView={pathname === "/signup" ? "signup" : "signin"}
+        initialView={
+          pathname === "/signup" ? "signup" : pathname === "/forgot-password" ? "forgot_password" : "signin"
+        }
       />
     );
   }
+
+  // Signed-in users can still reach the standalone recovery page directly.
+  if (pathname === "/forgot-password") return <ForgotPasswordPage />;
 
   if (supabaseUser && isPublicAuthPath) {
     window.history.replaceState({}, "", "/dashboard");
