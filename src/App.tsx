@@ -14,6 +14,7 @@ import { ProModal } from "./components/ProModal";
 import { HotTakeModal } from "./components/HotTakeModal";
 import { AuthContainer } from "./components/auth/AuthContainer";
 import { AuthCallbackPage, ForgotPasswordPage, ResetPasswordPage } from "./components/auth/AuthRoutes";
+import { MarketingSite, isMarketingPath } from "./components/marketing/MarketingSite";
 
 /** Paths that render the auth UI for signed-out visitors. */
 const PUBLIC_AUTH_PATHS = new Set(["/", "/login", "/signup", "/forgot-password"]);
@@ -44,6 +45,21 @@ export default function App() {
   const [currentUser, setCurrentUser] = useState<AuthUser | null>(null);
   const [isGuest, setIsGuest] = useState(false);
   const [showAuthView, setShowAuthView] = useState<AuthView | null>(null);
+
+  // Current URL path as React state so SPA navigation (marketing site <-> auth
+  // <-> app) re-renders without a full page reload.
+  const [pathname, setPathname] = useState(() => window.location.pathname);
+  const navigate = (path: string) => {
+    if (window.location.pathname !== path) {
+      window.history.pushState({}, "", path);
+    }
+    setPathname(path);
+  };
+  useEffect(() => {
+    const syncPath = () => setPathname(window.location.pathname);
+    window.addEventListener("popstate", syncPath);
+    return () => window.removeEventListener("popstate", syncPath);
+  }, []);
 
   const [profile, setProfile] = useState<UserProfile | null>(() => {
     const user = getCurrentUser();
@@ -278,19 +294,24 @@ export default function App() {
   // makes the redirect depend on render timing.
   useEffect(() => {
     if (authLoading) return;
-    const path = window.location.pathname;
+    const path = pathname;
     if (AUTH_CALLBACK_PATHS.has(path)) return;
 
     if (!supabaseUser && !isGuest) {
-      if (!PUBLIC_AUTH_PATHS.has(path)) window.history.replaceState({}, "", "/login");
+      // Marketing pages (landing, blog, pricing, about) are public.
+      if (!PUBLIC_AUTH_PATHS.has(path) && !isMarketingPath(path)) {
+        window.history.replaceState({}, "", "/login");
+        setPathname("/login");
+      }
       return;
     }
 
     if (supabaseUser && PUBLIC_AUTH_PATHS.has(path)) {
       window.history.replaceState({}, "", "/dashboard");
+      setPathname("/dashboard");
       setActiveTab("today");
     }
-  }, [authLoading, supabaseUser, isGuest]);
+  }, [authLoading, supabaseUser, isGuest, pathname]);
 
   useEffect(() => {
     if (activeTab === "admin" && !adminAllowed) {
@@ -304,9 +325,7 @@ export default function App() {
   const handleSelectTab = (tab: AppTab) => {
     setActiveTab(tab);
     const nextPath = tab === "admin" ? "/admin" : tab === "today" ? "/dashboard" : `/${tab}`;
-    if (window.location.pathname !== nextPath) {
-      window.history.pushState({}, "", nextPath);
-    }
+    navigate(nextPath);
   };
 
   const handleAuthSuccess = (user: AuthUser) => {
@@ -713,12 +732,24 @@ export default function App() {
     setMessages((prev) => [...prev, proMessage]);
   };
 
-  const pathname = window.location.pathname;
   if (authLoading) {
     return <div className="min-h-screen bg-[#FFFBEB] flex items-center justify-center font-black">CHECKING YOUR SESSION...</div>;
   }
   if (pathname === "/auth/callback") return <AuthCallbackPage />;
   if (pathname === "/auth/reset-password") return <ResetPasswordPage />;
+
+  // Public marketing site: landing, blog, pricing, manifesto. Signed-out
+  // visitors get all of it (including "/"); signed-in users and guests can
+  // still browse everything except "/", which routes into the app.
+  if (isMarketingPath(pathname)) {
+    const isAuthed = !!supabaseUser || isGuest;
+    if (!isAuthed || pathname !== "/") {
+      return (
+        <MarketingSite pathname={pathname} navigate={navigate} isAuthed={isAuthed} />
+      );
+    }
+  }
+
   if (!supabaseUser && !isGuest) {
     return (
       <AuthContainer

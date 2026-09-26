@@ -98,5 +98,24 @@
   animation: button-punch 0.38s cubic-bezier(0.2, 0.8, 0.2, 1);
 }
 
+/* Scrolling marquee strip on the marketing landing page */
+@keyframes marquee-scroll {
+  0% {
+    transform: translateX(0);
+  }
+  100% {
+    transform: translateX(-50%);
+  }
+}
+
+.marquee-track {
+  animation: marquee-scroll 24s linear infinite;
+  width: max-content;
+}
+
+.marquee-track:hover {
+  animation-play-state: paused;
+}
+
 
 
