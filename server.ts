@@ -64,20 +64,36 @@ const env = envResult.data;
 
 const isProd = env.NODE_ENV === 'production';
 const demoMode = env.ALLOW_DEMO_MODE === 'true';
+const onVercel = Boolean(process.env.VERCEL);
 const SUPABASE_URL = env.SUPABASE_URL ?? env.VITE_SUPABASE_URL ?? null;
 const SUPABASE_SERVICE_ROLE_KEY = env.SUPABASE_SERVICE_ROLE_KEY ?? null;
 const GEMINI_API_KEY =
   env.GEMINI_API_KEY && env.GEMINI_API_KEY !== 'MY_GEMINI_API_KEY' ? env.GEMINI_API_KEY : null;
 
-if (isProd && demoMode) {
-  console.error('FATAL: ALLOW_DEMO_MODE must be false when NODE_ENV=production.');
+// A misconfigured standalone server must fail fast and loudly. Inside a
+// Vercel serverless function, however, process.exit() at import time turns
+// every request into an opaque 500 FUNCTION_INVOCATION_FAILED page. There we
+// record the problem instead and answer every request with a clear JSON 503
+// (see the boot-problem middleware below the health checks).
+let bootProblem: string | null = null;
+const fatal = (message: string): void => {
+  if (onVercel) {
+    bootProblem = message;
+    return;
+  }
+  console.error(`FATAL: ${message}`);
   process.exit(1);
+};
+
+if (isProd && demoMode) {
+  fatal('ALLOW_DEMO_MODE must be false when NODE_ENV=production.');
 }
 
 if (!demoMode && (!SUPABASE_URL || !SUPABASE_SERVICE_ROLE_KEY)) {
-  console.error('FATAL: SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY are required in production.');
-  console.error('       Set ALLOW_DEMO_MODE=true only for local development without a database.');
-  process.exit(1);
+  fatal(
+    'Server configuration is incomplete: SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY are required. ' +
+      'Set them in Vercel → Project → Settings → Environment Variables (Production and Preview), then redeploy.',
+  );
 }
 
 const logger = pino({
@@ -1235,6 +1251,17 @@ app.get('/healthz', (_req, res) => {
   res.json({ status: 'ok', uptime: process.uptime(), mode: demoMode ? 'demo' : 'production' });
 });
 
+// Deployment smoke test that works on Vercel (where only /api/* reaches this
+// app) even when the database configuration is missing — see bootProblem.
+app.get('/api/health', (_req, res) => {
+  res.json({
+    status: bootProblem ? 'degraded' : 'ok',
+    uptime: process.uptime(),
+    mode: demoMode ? 'demo' : 'production',
+    ...(bootProblem ? { problem: bootProblem } : {}),
+  });
+});
+
 app.get(
   '/readyz',
   ah(async (_req, res) => {
@@ -1244,6 +1271,17 @@ app.get(
     res.json({ status: 'ready' });
   }),
 );
+
+// Guard rail for a misconfigured serverless deployment: without this, a
+// missing SUPABASE_URL/SERVICE_ROLE_KEY would crash the function on cold
+// start and every request would surface as Vercel's opaque 500 error page.
+// Health checks registered above stay available; everything else gets a
+// clear, actionable JSON 503.
+if (bootProblem) {
+  app.use((_req: Request, res: Response) => {
+    res.status(503).json({ error: bootProblem, code: 'SERVER_NOT_CONFIGURED' });
+  });
+}
 
 // ============================================================================
 // API ROUTES: TASKS & PROGRESS (same contract as before)
