@@ -14,6 +14,11 @@ import { ProModal } from "./components/ProModal";
 import { HotTakeModal } from "./components/HotTakeModal";
 import { AuthContainer } from "./components/auth/AuthContainer";
 import { AuthCallbackPage, ForgotPasswordPage, ResetPasswordPage } from "./components/auth/AuthRoutes";
+
+/** Paths that render the auth UI for signed-out visitors. */
+const PUBLIC_AUTH_PATHS = new Set(["/", "/login", "/signup", "/forgot-password"]);
+/** Supabase redirect targets that must never be rewritten to /login. */
+const AUTH_CALLBACK_PATHS = new Set(["/auth/callback", "/auth/reset-password"]);
 import { useAuth } from "./context/AuthContext";
 import { getTodayHotTake } from "./data/hotTakes";
 import {
@@ -266,6 +271,26 @@ export default function App() {
     window.addEventListener("popstate", handleRouteChange);
     return () => window.removeEventListener("popstate", handleRouteChange);
   }, []);
+
+  // Keep the URL aligned with auth state. This has to live in an effect:
+  // calling history.replaceState / setActiveTab straight from the render body
+  // triggers React's "Cannot update a component while rendering" warning and
+  // makes the redirect depend on render timing.
+  useEffect(() => {
+    if (authLoading) return;
+    const path = window.location.pathname;
+    if (AUTH_CALLBACK_PATHS.has(path)) return;
+
+    if (!supabaseUser && !isGuest) {
+      if (!PUBLIC_AUTH_PATHS.has(path)) window.history.replaceState({}, "", "/login");
+      return;
+    }
+
+    if (supabaseUser && PUBLIC_AUTH_PATHS.has(path)) {
+      window.history.replaceState({}, "", "/dashboard");
+      setActiveTab("today");
+    }
+  }, [authLoading, supabaseUser, isGuest]);
 
   useEffect(() => {
     if (activeTab === "admin" && !adminAllowed) {
@@ -694,10 +719,7 @@ export default function App() {
   }
   if (pathname === "/auth/callback") return <AuthCallbackPage />;
   if (pathname === "/auth/reset-password") return <ResetPasswordPage />;
-  const isPublicAuthPath =
-    pathname === "/login" || pathname === "/signup" || pathname === "/forgot-password" || pathname === "/";
   if (!supabaseUser && !isGuest) {
-    if (!isPublicAuthPath) window.history.replaceState({}, "", "/login");
     return (
       <AuthContainer
         onAuthSuccess={handleAuthSuccess}
@@ -710,11 +732,6 @@ export default function App() {
 
   // Signed-in users can still reach the standalone recovery page directly.
   if (pathname === "/forgot-password") return <ForgotPasswordPage />;
-
-  if (supabaseUser && isPublicAuthPath) {
-    window.history.replaceState({}, "", "/dashboard");
-    setActiveTab("today");
-  }
 
   if (!profile) {
     return <Onboarding onComplete={handleOnboardingComplete} />;
