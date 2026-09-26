@@ -66,6 +66,10 @@ interface CoachTabProps {
   isTyping: boolean;
 
   initialContext?: string;
+
+  savedMode?: CoachMode;
+
+  onModeChange?: (mode: CoachMode) => void;
 }
 
 export type CoachMode =
@@ -363,6 +367,8 @@ export const CoachTab: React.FC<CoachTabProps> = ({
   onMessageFeedback,
   isTyping,
   initialContext,
+  savedMode,
+  onModeChange,
 }) => {
 
   /* =======================================================
@@ -377,6 +383,7 @@ export const CoachTab: React.FC<CoachTabProps> = ({
 
   const [mode, setMode] =
     useState<CoachMode>(() => {
+      if (savedMode) return savedMode;
 
       try {
         const saved =
@@ -473,13 +480,17 @@ export const CoachTab: React.FC<CoachTabProps> = ({
   ======================================================= */
 
   useEffect(() => {
+    if (onModeChange) {
+      onModeChange(mode);
+      return;
+    }
     try {
       localStorage.setItem(
         "datings_coach_mode",
         mode
       );
     } catch {}
-  }, [mode]);
+  }, [mode, onModeChange]);
 
 
   useEffect(() => {

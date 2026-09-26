@@ -1,4 +1,4 @@
-import React, { useMemo, useState } from "react";
+import React, { useEffect, useMemo, useState } from "react";
 import {
   ArrowLeft,
   ArrowRight,
@@ -17,7 +17,7 @@ import {
   Zap,
   MessageCircle,
 } from "lucide-react";
-import { AdminSettings, UserProfile, UserProgress } from "../types";
+import { AdminSettings, CommunityUserState, UserProfile, UserProgress } from "../types";
 import { COMMUNITY_TEACHINGS, CommunityTeaching } from "../data/community";
 
 interface CommunityTabProps {
@@ -30,6 +30,8 @@ interface CommunityTabProps {
   onOpenCoach?: (context: string) => void;
   onPracticeToday?: (lessonId?: number) => void;
   onAwardXp?: (amount: number, reason: string) => void;
+  userState?: CommunityUserState;
+  onUserStateChange?: (state: CommunityUserState) => void;
 }
 
 const FILTERS = [
@@ -143,6 +145,8 @@ export const CommunityTab: React.FC<CommunityTabProps> = ({
   onOpenCoach,
   onPracticeToday,
   onAwardXp,
+  userState,
+  onUserStateChange,
 }) => {
   const [selectedTeaching, setSelectedTeaching] =
     useState<CommunityTeaching | null>(null);
@@ -153,14 +157,15 @@ export const CommunityTab: React.FC<CommunityTabProps> = ({
   const [search, setSearch] = useState("");
 
   const [saved, setSaved] = useState<Set<string>>(() =>
-    readSet(storageKey(userId, "saved"))
+    userState ? new Set(userState.saved) : readSet(storageKey(userId, "saved"))
   );
 
   const [completed, setCompleted] = useState<Set<string>>(() =>
-    readSet(storageKey(userId, "completed"))
+    userState ? new Set(userState.completed) : readSet(storageKey(userId, "completed"))
   );
 
   const [reactions, setReactions] = useState<Record<string, string>>(() => {
+    if (userState) return userState.reactions;
     try {
       return JSON.parse(
         localStorage.getItem(storageKey(userId, "reactions")) || "{}"
@@ -169,6 +174,31 @@ export const CommunityTab: React.FC<CommunityTabProps> = ({
       return {};
     }
   });
+
+  useEffect(() => {
+    if (!userState) return;
+    setSaved(new Set(userState.saved));
+    setCompleted(new Set(userState.completed));
+    setReactions(userState.reactions);
+  }, [userState]);
+
+  const publishUserState = (
+    nextSaved: Set<string>,
+    nextCompleted: Set<string>,
+    nextReactions: Record<string, string>,
+  ) => {
+    const next = {
+      saved: [...nextSaved],
+      completed: [...nextCompleted],
+      reactions: nextReactions,
+    };
+    onUserStateChange?.(next);
+    if (!onUserStateChange) {
+      writeSet(storageKey(userId, "saved"), nextSaved);
+      writeSet(storageKey(userId, "completed"), nextCompleted);
+      localStorage.setItem(storageKey(userId, "reactions"), JSON.stringify(nextReactions));
+    }
+  };
 
   const [readProgress, setReadProgress] = useState<Record<string, number>>(
     {}
@@ -372,7 +402,7 @@ export const CommunityTab: React.FC<CommunityTabProps> = ({
     }
 
     setSaved(next);
-    writeSet(storageKey(userId, "saved"), next);
+    publishUserState(next, completed, reactions);
   };
 
   /*
@@ -386,8 +416,7 @@ export const CommunityTab: React.FC<CommunityTabProps> = ({
     next.add(teaching.id);
 
     setCompleted(next);
-
-    writeSet(storageKey(userId, "completed"), next);
+    publishUserState(saved, next, reactions);
 
     onAwardXp?.(
       teaching.xp,
@@ -410,11 +439,7 @@ export const CommunityTab: React.FC<CommunityTabProps> = ({
     };
 
     setReactions(next);
-
-    localStorage.setItem(
-      storageKey(userId, "reactions"),
-      JSON.stringify(next)
-    );
+    publishUserState(saved, completed, next);
   };
 
   /*

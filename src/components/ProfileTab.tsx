@@ -1,4 +1,4 @@
-import React, { useMemo, useRef, useState } from "react";
+import React, { useEffect, useMemo, useRef, useState } from "react";
 import {
   ArrowRight,
   Award,
@@ -25,6 +25,9 @@ import {
   AuthUser,
   AuthView,
   ChatMessage,
+  PrivateJournalEntry,
+  PrivateJournalType,
+  ProfileAuditReport,
   UserProfile,
   UserProgress,
 } from "../types";
@@ -32,7 +35,6 @@ import {
 import { BADGES } from "../data/badges";
 import { getRankInfo } from "../data/lessons";
 import { processUploadFile } from "../utils/imageCompressor";
-import { verifyAndResetPassword } from "../utils/authStorage";
 
 interface ProfileTabProps {
   profile: UserProfile;
@@ -53,34 +55,21 @@ interface ProfileTabProps {
   maxFreeChats: number;
   onDowngradeToFree: () => void;
   currentUser?: AuthUser | null;
-  onSignOut?: () => void;
+  onSignOut?: () => void | Promise<void>;
   onOpenAuth?: (view?: AuthView) => void;
+  privateJournal?: PrivateJournalEntry[];
+  profileAudit?: ProfileAuditReport | null;
+  onPrivateDataChange?: (
+    journal: PrivateJournalEntry[],
+    audit: ProfileAuditReport | null,
+  ) => void;
+  syncStatus?: "loading" | "synced" | "saving" | "offline";
+  syncError?: string;
+  onUpdatePassword?: (password: string) => Promise<{ error?: string }>;
 }
 
-type JournalType =
-  | "date recap"
-  | "rejection"
-  | "confidence"
-  | "lesson learned"
-  | "observation";
-
-interface PrivateJournalEntry {
-  id: string;
-  title: string;
-  content: string;
-  type: JournalType;
-  createdAt: string;
-}
-
-interface AuditReport {
-  id: string;
-  score: number;
-  createdAt: string;
-  photos: number;
-  personality: number;
-  clarity: number;
-  fix: string;
-}
+type JournalType = PrivateJournalType;
+type AuditReport = ProfileAuditReport;
 
 const SKILLS = [
   "texting",
@@ -149,6 +138,12 @@ export const ProfileTab: React.FC<ProfileTabProps> = ({
   currentUser,
   onSignOut,
   onOpenAuth,
+  privateJournal,
+  profileAudit,
+  onPrivateDataChange,
+  syncStatus = "synced",
+  syncError,
+  onUpdatePassword,
 }) => {
   const userKey = currentUser?.id || "guest";
 
@@ -158,12 +153,31 @@ export const ProfileTab: React.FC<ProfileTabProps> = ({
   const [notice, setNotice] = useState("");
 
   const [audit, setAudit] = useState<AuditReport | null>(() =>
-    readJson(`datings_audits_${userKey}`, null)
+    profileAudit !== undefined
+      ? profileAudit
+      : readJson(`datings_audits_${userKey}`, null)
   );
 
   const [journal, setJournal] = useState<PrivateJournalEntry[]>(() =>
-    readJson(`datings_journal_${userKey}`, [])
+    privateJournal ?? readJson(`datings_journal_${userKey}`, [])
   );
+
+  useEffect(() => {
+    if (profileAudit !== undefined) setAudit(profileAudit);
+    if (privateJournal !== undefined) setJournal(privateJournal);
+  }, [privateJournal, profileAudit, userKey]);
+
+  const publishPrivateData = (
+    nextJournal: PrivateJournalEntry[],
+    nextAudit: AuditReport | null,
+  ) => {
+    if (onPrivateDataChange) {
+      onPrivateDataChange(nextJournal, nextAudit);
+      return;
+    }
+    saveJson(`datings_journal_${userKey}`, nextJournal);
+    saveJson(`datings_audits_${userKey}`, nextAudit);
+  };
 
   const [journalTitle, setJournalTitle] = useState("");
   const [journalContent, setJournalContent] = useState("");
@@ -338,8 +352,7 @@ export const ProfileTab: React.FC<ProfileTabProps> = ({
     };
 
     setAudit(next);
-
-    saveJson(`datings_audits_${userKey}`, next);
+    publishPrivateData(journal, next);
 
     onAwardXp?.(15, "Completed profile audit");
 
@@ -367,8 +380,7 @@ export const ProfileTab: React.FC<ProfileTabProps> = ({
       : [nextEntry, ...journal];
 
     setJournal(next);
-
-    saveJson(`datings_journal_${userKey}`, next);
+    publishPrivateData(next, audit);
 
     setJournalTitle("");
     setJournalContent("");
@@ -390,8 +402,7 @@ export const ProfileTab: React.FC<ProfileTabProps> = ({
     );
 
     setJournal(next);
-
-    saveJson(`datings_journal_${userKey}`, next);
+    publishPrivateData(next, audit);
   };
 
   const updateSetting = (
@@ -445,7 +456,7 @@ export const ProfileTab: React.FC<ProfileTabProps> = ({
     setResetText("");
   };
 
-  const savePassword = (
+  const savePassword = async (
     event: React.FormEvent
   ) => {
     event.preventDefault();
@@ -456,22 +467,14 @@ export const ProfileTab: React.FC<ProfileTabProps> = ({
       );
       return;
     }
-
-    const result = verifyAndResetPassword({
-      identifier: currentUser.username,
-      code: "123456",
-      newPassword,
-    });
-
-    setPasswordMessage(
-      result.success
-        ? "Password updated."
-        : result.error || "Could not update password."
-    );
-
-    if (result.success) {
-      setNewPassword("");
+    if (!onUpdatePassword) {
+      setPasswordMessage("Password updates are unavailable right now.");
+      return;
     }
+
+    const result = await onUpdatePassword(newPassword);
+    setPasswordMessage(result.error || "Password updated.");
+    if (!result.error) setNewPassword("");
   };
 
   const visibleSkills = showAllSkills
@@ -1409,6 +1412,22 @@ export const ProfileTab: React.FC<ProfileTabProps> = ({
                 {isPro
                   ? "Pro"
                   : `Free • ${chatsUsedToday}/${maxFreeChats}`}
+              </span>
+            </div>
+
+            <div className="flex justify-between gap-3">
+              <b>Cloud data</b>
+              <span
+                className={syncStatus === "offline" ? "text-red-700 font-black" : "font-black"}
+                title={syncError || "Your account data is available on every signed-in device."}
+              >
+                {syncStatus === "saving"
+                  ? "Saving…"
+                  : syncStatus === "offline"
+                    ? "Offline — cached"
+                    : syncStatus === "loading"
+                      ? "Loading…"
+                      : "Synced"}
               </span>
             </div>
 
