@@ -38,7 +38,11 @@ Required environment variables (Vercel → Project → Settings → Environment 
 
 Without `SUPABASE_URL` and `SUPABASE_SERVICE_ROLE_KEY` the function refuses to boot (by design), so set them before the first deploy.
 
-Verify a deployment with `curl https://datings.lol/healthz` — it must return `{"status":"ok",...}` JSON. If you get the sign-in page HTML instead, the API is not being routed to the function and every API-dependent feature (coach, Pro entitlements, the admin panel) is broken.
+Verify a deployment with `curl https://datings.lol/api/health` (only `/api/*` paths reach the server on Vercel):
+
+- `{"status":"ok",...}` — the API is live and fully configured.
+- `{"status":"degraded","problem":"..."}` — the function runs but `SUPABASE_URL` / `SUPABASE_SERVICE_ROLE_KEY` are missing; set them per the table above and redeploy.
+- The sign-in page HTML — the API is not being routed to the function at all, and every API-dependent feature (coach, Pro entitlements, the admin panel) is broken.
 
 ## Cross-device data
 
