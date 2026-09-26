@@ -43,10 +43,26 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
 
   useEffect(() => {
     let mounted = true;
-    supabase.auth.getSession().then(({ data, error }) => {
+
+    // Supabase normally consumes recovery links automatically from the URL
+    // hash. When the project is configured for PKCE, however, the email link
+    // contains a `code` query parameter and the browser must exchange it
+    // before the reset page can see a session. Do this before getSession so a
+    // valid link is never briefly treated as an expired one.
+    const code = new URLSearchParams(window.location.search).get("code");
+    const loadSession = async () => {
+      const result = code
+        ? await supabase.auth.exchangeCodeForSession(code)
+        : await supabase.auth.getSession();
       if (!mounted) return;
-      setSession(data.session);
-      if (error) setAuthError(friendlyAuthError(error));
+      setSession(result.data.session);
+      if (result.error) setAuthError(friendlyAuthError(result.error));
+      setLoading(false);
+    };
+
+    loadSession().catch((error) => {
+      if (!mounted) return;
+      setAuthError(friendlyAuthError(error));
       setLoading(false);
     });
 
