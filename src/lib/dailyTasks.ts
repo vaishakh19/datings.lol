@@ -39,7 +39,17 @@ export interface DailyTaskProgress {
 }
 
 export interface CompleteTaskOutcome {
-  status: "completed" | "already_completed" | "not_found" | "noop" | "reverted";
+  /**
+   * `not_available` means the row exists but is not in `pending` (e.g. it was
+   * skipped). The server refuses to pay XP for it; the client resyncs.
+   */
+  status:
+    | "completed"
+    | "already_completed"
+    | "not_available"
+    | "not_found"
+    | "noop"
+    | "reverted";
   xpAwarded: number;
   task: DailyTask | null;
   progress: DailyTaskProgress | null;

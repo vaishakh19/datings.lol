@@ -98,10 +98,11 @@ Every signed-in user gets a personalized set of tasks per calendar day. Selectio
 
 ### Functions
 
-- `generate_daily_tasks(p_user_id uuid, p_date date) -> setof daily_tasks` — returns the day's set, creating it on first call. Idempotent: a transaction-scoped advisory lock on `(user, date)` plus the unique index `daily_tasks (user_id, task_date, template_id)` mean concurrent calls converge on the same rows. A signed-in caller can only generate their own tasks; the service role can generate for anyone.
-- `complete_daily_task(p_daily_task_id uuid, p_user_id uuid) -> jsonb` — flips the row, awards XP, and updates level/streak/counters in one transaction. The status guard makes a second call return `already_completed` with `xpAwarded: 0`, so XP can never be paid twice.
-- `uncomplete_daily_task(p_daily_task_id uuid, p_user_id uuid) -> jsonb` — symmetrical undo.
-- `ensure_user_progress`, `task_level_for_xp`, `task_tier_for_progress` — helpers.
+- `generate_daily_tasks(p_user_id uuid, p_date date) -> setof daily_tasks` — returns the day's set, creating it on first call. Idempotent: a transaction-scoped advisory lock on `(user, date)` plus the unique index `daily_tasks (user_id, task_date, template_id)` mean concurrent calls converge on the same rows. It *tops up* a short day (a legacy row, or a partial set from a failed run) rather than refusing to act, but never touches a day that already holds three or more tasks — so the set you saw this morning cannot change this afternoon. A signed-in caller can only generate their own tasks; the service role can generate for anyone.
+- `complete_daily_task(p_daily_task_id uuid, p_user_id uuid) -> jsonb` — flips the row, awards XP, and updates level/streak/counters in one transaction. Only a `pending` task can be completed: a second call returns `already_completed` with `xpAwarded: 0`, and a skipped task returns `not_available`. The `user_progress` row is taken `FOR UPDATE` before XP is recomputed, so two tasks completed in the same instant cannot lose one another's award.
+- `uncomplete_daily_task(p_daily_task_id uuid, p_user_id uuid) -> jsonb` — undo. Reverses XP, `tasks_completed`, and both counter maps exactly, and recomputes `last_completed_date` from the remaining completions. Streaks are deliberately **not** rebuilt unless the user has no completions left: a streak records days attended, and undoing one tap should not be able to destroy a 40-day run.
+- `ensure_user_progress` — **internal only.** It accepts an arbitrary user id, so it is revoked from `authenticated`; exposing it as an RPC would let any signed-in user read another user's XP and streak. The definer functions call it as the function owner.
+- `task_level_for_xp`, `task_tier_for_progress`, `task_counter_read`, `task_counter_bump`, `task_profiles_xp_syncable`, `task_daily_tasks_needs_profile` — helpers.
 
 ### How selection works (rule-based, no AI provider)
 
@@ -114,6 +115,14 @@ Every signed-in user gets a personalized set of tasks per calendar day. Selectio
 ### Security
 
 RLS is enabled on all three tables. Users can `select` only their own `daily_tasks` and `user_progress`; the only column they may write directly is `daily_tasks.started_at` (a column-level grant). There is no insert or delete policy — rows can only be created by the `SECURITY DEFINER` generator, and XP can only move through the `SECURITY DEFINER` completion functions. `task_templates` is readable by any authenticated user but only when `active` and `PUBLISHED`; writes stay admin-only.
+
+RLS does **not** constrain the internal queries of a `SECURITY DEFINER` function, so each one is treated as a privileged API endpoint and authorizes its caller explicitly:
+
+- every definer function runs with `search_path = ''` and schema-qualifies every object it touches, per Supabase's database-function guidance;
+- `generate_daily_tasks`, `complete_daily_task`, and `uncomplete_daily_task` compare `p_user_id` against `auth.uid()` and raise `42501` on a mismatch, so a signed-in user can only ever act on their own rows. A null `auth.uid()` means the service role, which may act for any user;
+- `ensure_user_progress` performs no such check, which is exactly why it is **not** granted to `authenticated`.
+
+The `profiles` XP mirror (kept so the admin user list stays accurate) is guarded by a catalog lookup rather than by catching runtime errors, so a genuine schema or permission problem surfaces instead of being silently swallowed.
 
 ### Where it lives in the app
 

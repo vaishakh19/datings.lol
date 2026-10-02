@@ -188,7 +188,9 @@ export function useDailyTasks({ userId, onXpAwarded }: UseDailyTasksOptions): Us
       try {
         const outcome = await completeDailyTask(taskId);
 
-        if (outcome.status === "not_found") {
+        // Either the row vanished or it is not in `pending` (e.g. skipped).
+        // Both mean our local copy is wrong, so roll back and resync.
+        if (outcome.status === "not_found" || outcome.status === "not_available") {
           setTasks((previous) =>
             previous.map((task) =>
               task.id === taskId ? { ...task, status: "pending", completedAt: null } : task,
