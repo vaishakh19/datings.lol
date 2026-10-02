@@ -1,5 +1,28 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" role="img" aria-labelledby="title">
-  <title>datings.lol</title>
-  <circle cx="32" cy="32" r="30" fill="#111111" stroke="#FFE066" stroke-width="4"/>
-  <text x="32" y="43" text-anchor="middle" fill="#FFFBEB" font-family="Arial, Helvetica, sans-serif" font-size="34" font-weight="900" letter-spacing="-3">d.</text>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" width="64" height="64">
+  <defs>
+    <filter id="brutal-shadow" x="-10%" y="-10%" width="130%" height="130%">
+      <feDropShadow dx="2" dy="2" stdDeviation="0" flood-color="#111111" flood-opacity="1" />
+    </filter>
+    <linearGradient id="flame-grad" x1="0%" y1="100%" x2="0%" y2="0%">
+      <stop offset="0%" stop-color="#FF3366" />
+      <stop offset="60%" stop-color="#FF9900" />
+      <stop offset="100%" stop-color="#FFE066" />
+    </linearGradient>
+  </defs>
+
+  <!-- Neo-brutalist Yellow Background Badge with Black Outline -->
+  <rect x="3" y="3" width="56" height="56" rx="14" fill="#FFE066" stroke="#111111" stroke-width="4" />
+  
+  <!-- Offset Inner Black Disc -->
+  <circle cx="31" cy="31" r="21" fill="#111111" />
+
+  <!-- Stylized Flame & Heart Motif -->
+  <path d="M31 16 C31 16 37 22 37 27 C37 29.5 35.8 31.7 34.2 33 C35.8 33.3 38 31.5 38 31.5 C38 31.5 41 35.5 39.5 39 C38 42.5 34.5 45 30.5 45 C25.5 45 22 41 22 36 C22 28.5 28 22 31 16 Z" fill="url(#flame-grad)" />
+  
+  <!-- Inner Flame Spark -->
+  <path d="M31 32 C31 32 33.5 35 33.5 37.5 C33.5 39.5 32 41.5 30 41.5 C28 41.5 26.5 39.8 26.5 37.5 C26.5 34.5 29.5 33 31 32 Z" fill="#FFFBEB" />
+
+  <!-- Playful "lol" sparkle / dot -->
+  <circle cx="43" cy="18" r="3" fill="#111111" />
+  <circle cx="43" cy="18" r="1.5" fill="#FFE066" />
 </svg>
