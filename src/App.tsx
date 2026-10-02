@@ -673,6 +673,50 @@ export default function App() {
     }));
   };
 
+  /**
+   * XP for a database-backed daily task. The server already awarded it in
+   * `user_progress` (exactly once); this mirrors it into the synced app state
+   * so the header, rank, and badges stay in step. The awarded-key guard keeps
+   * the mirror idempotent even if the component remounts.
+   */
+  const handleDailyTaskXp = (amount: number, taskId: string, taskTitle: string) => {
+    const transactionKey = `dailytask_${taskId}`;
+    if (awardedXpKeys.includes(transactionKey)) return;
+    setAwardedXpKeys((previous) => [...previous, transactionKey].slice(-250));
+
+    const todayStr = new Date().toDateString();
+    setProgress((previous) => {
+      const alreadyCompletedToday = previous.lastCompletedDate === todayStr;
+      const nextStreak = alreadyCompletedToday
+        ? Math.max(previous.streak, 1)
+        : previous.streak + 1;
+
+      return {
+        ...previous,
+        xp: previous.xp + amount,
+        streak: nextStreak,
+        lastCompletedDate: todayStr,
+        completedDates: [...new Set([...previous.completedDates, todayStr])],
+        journal: [
+          {
+            id: `daily-task-${taskId}`,
+            date: new Date().toISOString(),
+            day: currentDay,
+            lessonTitle: taskTitle,
+            reflection: "Daily task completed",
+            xp: amount,
+          },
+          ...previous.journal,
+        ],
+      };
+    });
+
+    setShowConfetti(true);
+    setIsBouncingStreak(true);
+    setTimeout(() => setIsBouncingStreak(false), 1200);
+    setTimeout(() => setShowConfetti(false), 2200);
+  };
+
   const handlePracticeToday = (lessonId?: number) => {
     if (lessonId) {
       const lesson = LESSONS.find((item) => item.id === lessonId);
@@ -1047,6 +1091,8 @@ export default function App() {
             onPracticeComplete={handlePracticeComplete}
             onRealWorldComplete={() => handleCompleteDay("Completed today's real-world move", false)}
             adminNote={adminSettings.dailyOverride.note}
+            userId={supabaseUser?.id ?? null}
+            onDailyTaskXp={handleDailyTaskXp}
           />
         )}
 

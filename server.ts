@@ -387,6 +387,7 @@ interface DataStore {
   tasks: {
     getOrCreateToday(userId: string, input: Record<string, unknown>): Promise<GeneratedTask>;
     getToday(userId: string): Promise<GeneratedTask | null>;
+    listDay(userId: string, date: string): Promise<GeneratedTask[]>;
     complete(userId: string, taskId: string): Promise<CompleteTaskResult>;
     getProgress(userId: string): Promise<{ xp: number; streak: number; skills: Record<string, { completed: number; total: number }> }>;
   };
@@ -465,6 +466,10 @@ function createMemoryStore(): DataStore {
       },
       getToday(userId) {
         return Promise.resolve(tasks.get(`${userId}:${todayKey()}`) ?? null);
+      },
+      listDay(userId, date) {
+        const existing = tasks.get(`${userId}:${date}`);
+        return Promise.resolve(existing ? [existing] : []);
       },
       async complete(userId, taskId) {
         const k = `${userId}:${todayKey()}`;
@@ -665,79 +670,104 @@ function createSupabaseStore(): DataStore {
     isPro: Boolean(row?.is_pro),
   });
 
+  // `daily_tasks` rows are produced by the database rule engine
+  // (generate_daily_tasks). The API only reads them and delegates completion
+  // to complete_daily_task so XP can never be awarded twice.
+  const rowToTask = (row: any): GeneratedTask => ({
+    id: String(row.id),
+    userId: String(row.user_id),
+    taskDate: String(row.task_date),
+    skill: row.category ?? 'texting',
+    kind: 'PRACTICE' as TaskKind,
+    title: row.title ?? 'Daily task',
+    description: row.description ?? '',
+    difficulty: (row.difficulty ?? 'BEGINNER') as Difficulty,
+    xpReward: Number(row.xp_reward) || 0,
+    completed: row.status === 'completed',
+  });
+
+  const generateDay = async (userId: string, date: string): Promise<GeneratedTask[]> => {
+    const { data, error } = await sb().rpc('generate_daily_tasks', {
+      p_user_id: userId,
+      p_date: date,
+    });
+    if (error) {
+      logger.warn({ err: error, userId }, 'generate_daily_tasks failed');
+      const { data: existing } = await sb()
+        .from('daily_tasks')
+        .select('*')
+        .eq('user_id', userId)
+        .eq('task_date', date)
+        .order('sort_order', { ascending: true });
+      return (existing ?? []).map(rowToTask);
+    }
+    return ((data as any[]) ?? []).map(rowToTask);
+  };
+
   return {
     tasks: {
       async getOrCreateToday(userId, input) {
-        const generated = buildDailyTask(userId, input);
-        const { data, error } = await sb()
-          .from('daily_tasks')
-          .upsert(
-            { user_id: userId, task_date: generated.taskDate, payload: generated as any },
-            { onConflict: 'user_id,task_date' },
-          )
-          .select('payload, completed')
-          .single();
-        if (error) {
-          logger.warn({ err: error, userId }, 'daily task upsert failed; returning generated task');
-          return generated;
-        }
-        return { ...(data.payload as GeneratedTask), completed: data.completed };
+        const date = typeof input?.date === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(input.date)
+          ? input.date
+          : todayKey();
+        const tasks = await generateDay(userId, date);
+        // The legacy single-task contract returns the first open task.
+        return tasks.find((task) => !task.completed) ?? tasks[0] ?? buildDailyTask(userId, input);
       },
       async getToday(userId) {
         const { data } = await sb()
           .from('daily_tasks')
-          .select('payload, completed')
+          .select('*')
           .eq('user_id', userId)
           .eq('task_date', todayKey())
-          .maybeSingle();
-        if (!data) return null;
-        return { ...(data.payload as GeneratedTask), completed: data.completed };
+          .order('sort_order', { ascending: true });
+        if (!data?.length) return null;
+        return rowToTask(data.find((row: any) => row.status !== 'completed') ?? data[0]);
+      },
+      async listDay(userId, date) {
+        return generateDay(userId, date);
       },
       async complete(userId, taskId) {
-        const { data: row } = await sb()
-          .from('daily_tasks')
-          .select('payload, completed')
-          .eq('user_id', userId)
-          .eq('task_date', todayKey())
-          .maybeSingle();
-        if (!row || (row.payload as GeneratedTask)?.id !== taskId) {
-          return { status: 'not_found', task: null };
-        }
-        const task = { ...(row.payload as GeneratedTask), completed: true };
-        const { data: updated, error } = await sb()
-          .from('daily_tasks')
-          .update({ completed: true, completed_at: new Date().toISOString(), payload: task })
-          .eq('user_id', userId)
-          .eq('task_date', todayKey())
-          .eq('completed', false)
-          .select('payload')
-          .maybeSingle();
+        // One transactional RPC: flips the row, awards XP exactly once, and
+        // updates level/streak/counters. Re-running it is a no-op.
+        const { data, error } = await sb().rpc('complete_daily_task', {
+          p_daily_task_id: taskId,
+          p_user_id: userId,
+        });
         if (error) throw new ApiError(500, 'Failed to complete task.');
-        if (!updated) return { status: 'already_completed', task }; // lost a race
-        await awardXp(userId, task.xpReward);
-        return { status: 'ok', task };
+
+        const payload = (data ?? {}) as any;
+        if (payload.status === 'not_found') return { status: 'not_found', task: null };
+        if (payload.status === 'already_completed') {
+          return { status: 'already_completed', task: payload.task ? rowToTask(payload.task) : null };
+        }
+        return { status: 'ok', task: payload.task ? rowToTask(payload.task) : null };
       },
       async getProgress(userId) {
-        const { data: profile } = await sb()
-          .from('profiles')
-          .select('xp, streak')
-          .eq('id', userId)
+        const { data: progress } = await sb()
+          .from('user_progress')
+          .select('xp, current_streak, category_counts')
+          .eq('user_id', userId)
           .maybeSingle();
         const since = new Date(Date.now() - 30 * 24 * 60 * 60 * 1000).toISOString().slice(0, 10);
         const { data: rows } = await sb()
           .from('daily_tasks')
-          .select('payload, completed')
+          .select('category, status')
           .eq('user_id', userId)
           .gte('task_date', since);
         const skills: Record<string, { completed: number; total: number }> = {};
         for (const row of rows ?? []) {
-          const skill = (row.payload as GeneratedTask)?.skill;
+          const skill = (row as any).category;
           if (!skill) continue;
           skills[skill] = skills[skill] || { completed: 0, total: 0 };
           skills[skill].total += 1;
-          if (row.completed) skills[skill].completed += 1;
+          if ((row as any).status === 'completed') skills[skill].completed += 1;
         }
-        return { xp: profile?.xp ?? 0, streak: profile?.streak ?? 0, skills };
+        return {
+          xp: progress?.xp ?? 0,
+          streak: progress?.current_streak ?? 0,
+          skills,
+        };
       },
     },
     community: {
@@ -1298,6 +1328,22 @@ app.get(
 
     const task = await store.tasks.getOrCreateToday(userId, req.query as Record<string, unknown>);
     res.json({ task, source: demoMode ? 'demo-cache' : 'supabase', generatedAt: new Date().toISOString() });
+  }),
+);
+
+// Full daily set. Idempotent: calling it repeatedly on the same day returns
+// the same rows, and the first call of a new day creates that day's set.
+app.get(
+  '/api/daily-tasks',
+  ah(async (req, res) => {
+    const userId = await requireAuth(req, res);
+    if (!userId) return;
+
+    const requested = typeof req.query.date === 'string' ? req.query.date : '';
+    const date = /^\d{4}-\d{2}-\d{2}$/.test(requested) ? requested : todayKey();
+
+    const tasks = await store.tasks.listDay(userId, date);
+    res.json({ userId, date, tasks, source: demoMode ? 'demo-cache' : 'supabase' });
   }),
 );
 

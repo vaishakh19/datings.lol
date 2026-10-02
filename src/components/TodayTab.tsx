@@ -21,6 +21,7 @@ import {
 
 import { Lesson, UserProgress } from "../types";
 import { getRankInfo } from "../data/lessons";
+import { DailyTasksCard } from "./DailyTasksCard";
 
 interface TodayTabProps {
   currentDay: number;
@@ -44,6 +45,16 @@ interface TodayTabProps {
   onRealWorldComplete?: () => void;
 
   adminNote?: string;
+
+  /** Supabase user id. Drives the database-backed daily task set. */
+  userId?: string | null;
+
+  /** Fired once per task with the XP the server actually awarded. */
+  onDailyTaskXp?: (
+    amount: number,
+    taskId: string,
+    taskTitle: string
+  ) => void;
 }
 
 
@@ -232,6 +243,8 @@ export const TodayTab: React.FC<TodayTabProps> = ({
   onPracticeComplete,
   onRealWorldComplete,
   adminNote,
+  userId,
+  onDailyTaskXp,
 }) => {
   const rank = getRankInfo(progress.xp);
 
@@ -1084,6 +1097,16 @@ export const TodayTab: React.FC<TodayTabProps> = ({
         </button>
 
       </section>
+
+
+      {/* =====================================================
+          DAILY TASKS (generated server-side, refreshed daily)
+      ===================================================== */}
+
+      <DailyTasksCard
+        userId={userId}
+        onXpAwarded={onDailyTaskXp}
+      />
 
 
       {/* =====================================================

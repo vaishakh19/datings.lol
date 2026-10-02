@@ -551,3 +551,14 @@ create policy "users update own app state" on public.user_app_state for update t
 create policy "users delete own app state" on public.user_app_state for delete to authenticated using ((select auth.uid()) = user_id);
 grant select, insert, update, delete on public.user_app_state to authenticated;
 revoke all on public.user_app_state from anon;
+
+-- ---------------------------------------------------------------------------
+-- Dynamic Daily Tasks
+-- ---------------------------------------------------------------------------
+-- The daily task engine (rule-based generation, per-user progress, XP, and
+-- streaks) lives in supabase/migrations/20261002000000_dynamic_daily_tasks.sql.
+-- That migration is additive and must be applied AFTER this file: it widens
+-- public.daily_tasks from one task per day to a per-day set, extends
+-- public.task_templates with the columns the rule engine needs, adds
+-- public.user_progress, and replaces the catch-all daily_tasks policy with
+-- read + completion-only access. Do not duplicate those objects here.
