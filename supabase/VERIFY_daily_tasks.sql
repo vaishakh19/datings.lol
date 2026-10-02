@@ -6,6 +6,24 @@
 
 
 -- ============================================================================
+-- STEP 0 — WHERE AM I?  (always safe, run this any time you are unsure)
+-- ----------------------------------------------------------------------------
+-- Tells you in one row whether the migration has been applied yet.
+-- ============================================================================
+
+select
+  to_regclass('public.user_progress') is not null                as migration_applied,
+  (select count(*) from pg_proc p join pg_namespace n on n.oid = p.pronamespace
+     where n.nspname = 'public' and p.proname = 'generate_daily_tasks')  as generator_fns,
+  (select count(*) from public.task_templates
+     where active and status = 'PUBLISHED')                      as seeded_templates;
+
+-- migration_applied = false  -> go do STEP 2. Nothing else will work.
+-- migration_applied = true, generator_fns = 1, seeded_templates = 30 -> ready.
+-- generator_fns = 2 -> an old overload survived; see note under STEP 3b.
+
+
+-- ============================================================================
 -- STEP 1 — PREFLIGHT (run BEFORE the migration)
 -- ----------------------------------------------------------------------------
 -- The migration drops a unique constraint and a NOT NULL on public.daily_tasks.
@@ -65,69 +83,81 @@ order by tablename, policyname;
 
 
 -- ============================================================================
--- STEP 4 — FIND YOUR OWN USER ID
+-- STEP 4 — PUT YOUR EMAIL IN
 -- ----------------------------------------------------------------------------
--- Replace the email, then copy the uuid it returns into the steps below.
+-- Every query below looks your account up by email, so there are no UUIDs to
+-- copy around. Use your editor's find-and-replace to swap YOUR_EMAIL_HERE for
+-- your real signup email across this whole file, then run the steps in order.
+--
+-- Sanity check that the email matches an account:
 -- ============================================================================
 
 select id, email, created_at
 from auth.users
 where lower(email) = lower('YOUR_EMAIL_HERE');
+-- Exactly 1 row expected. 0 rows = wrong email, fix it before continuing.
 
 
 -- ============================================================================
--- STEP 5 — BEHAVIOUR TEST  (⚠️ this one WRITES rows for the user below)
+-- STEP 5 — BEHAVIOUR TEST  (⚠️ these WRITE rows for your account)
 -- ----------------------------------------------------------------------------
--- Replace every 'USER_UUID' with the uuid from step 4.
--- Running as the SQL Editor = service role, so the ±1 day clamp does not
--- apply and you can jump dates freely.
+-- The SQL Editor runs as the service role, so the ±1 day clamp does not apply
+-- and you can jump dates freely. Run each block on its own.
 -- ============================================================================
 
--- 5a. Day 1 — a brand-new user gets 3 BEGINNER tasks in 3 distinct categories.
-select title, difficulty, category, xp_reward
-from public.generate_daily_tasks('USER_UUID', current_date);
+-- 5a. DAY 1 — a new account gets 3 BEGINNER tasks in 3 distinct categories.
+with me as (select id from auth.users where lower(email) = lower('YOUR_EMAIL_HERE'))
+select t.title, t.difficulty, t.category, t.xp_reward
+from me cross join lateral public.generate_daily_tasks(me.id, current_date) t;
 
--- 5b. IDEMPOTENCY — run 5a again. Identical titles, and still only 3 rows.
+-- 5b. IDEMPOTENCY — run 5a again: identical titles. Then confirm no duplicates:
+with me as (select id from auth.users where lower(email) = lower('YOUR_EMAIL_HERE'))
 select count(*) as should_be_3
-from public.daily_tasks
-where user_id = 'USER_UUID' and task_date = current_date;
+from public.daily_tasks dt, me
+where dt.user_id = me.id and dt.task_date = current_date;
 
--- 5c. Day 2 — a different set (day 1's templates are now on cooldown).
-select title, difficulty, category
-from public.generate_daily_tasks('USER_UUID', current_date + 1);
+-- 5c. DAY 2 — a different set (day 1's templates are now on cooldown).
+with me as (select id from auth.users where lower(email) = lower('YOUR_EMAIL_HERE'))
+select t.title, t.difficulty, t.category
+from me cross join lateral public.generate_daily_tasks(me.id, current_date + 1) t;
 
--- 5d. PROGRESSION — fake some history and watch the tier move up.
-update public.user_progress
+-- 5d. PROGRESSION — fake some history, watch the difficulty tier move up.
+with me as (select id from auth.users where lower(email) = lower('YOUR_EMAIL_HERE'))
+update public.user_progress up
 set tasks_completed = 30, level = 7
-where user_id = 'USER_UUID';
+from me where up.user_id = me.id;
 
-select title, difficulty
-from public.generate_daily_tasks('USER_UUID', current_date + 2);
+with me as (select id from auth.users where lower(email) = lower('YOUR_EMAIL_HERE'))
+select t.title, t.difficulty
+from me cross join lateral public.generate_daily_tasks(me.id, current_date + 2) t;
 -- Expected: mostly ADVANCED rows now.
 
--- 5e. XP IS AWARDED EXACTLY ONCE.
--- Grab one task id first:
-select id, title, xp_reward
-from public.daily_tasks
-where user_id = 'USER_UUID' and task_date = current_date
-limit 1;
-
--- Then run this twice with that id:
-select public.complete_daily_task('DAILY_TASK_UUID', 'USER_UUID');
+-- 5e. XP IS AWARDED EXACTLY ONCE — run this block TWICE.
+with me as (select id from auth.users where lower(email) = lower('YOUR_EMAIL_HERE')),
+     target as (
+       select dt.id from public.daily_tasks dt, me
+       where dt.user_id = me.id and dt.task_date = current_date
+       order by dt.sort_order limit 1
+     )
+select public.complete_daily_task(target.id, me.id) from target, me;
 -- 1st run: {"status":"completed","xpAwarded":15,...}
 -- 2nd run: {"status":"already_completed","xpAwarded":0,...}   <-- the guarantee
 
 -- 5f. Progress reflects it.
-select xp, level, tasks_completed, current_streak, longest_streak, category_counts
-from public.user_progress
-where user_id = 'USER_UUID';
+with me as (select id from auth.users where lower(email) = lower('YOUR_EMAIL_HERE'))
+select up.xp, up.level, up.tasks_completed, up.current_streak, up.category_counts
+from public.user_progress up, me
+where up.user_id = me.id;
 
 
 -- ============================================================================
 -- STEP 6 — CLEAN UP THE TEST DATA
 -- ----------------------------------------------------------------------------
--- Wipes the rows step 5 created so you start fresh in the real app.
+-- Wipes what step 5 created so the real app starts you fresh.
 -- ============================================================================
 
-delete from public.daily_tasks where user_id = 'USER_UUID';
-delete from public.user_progress where user_id = 'USER_UUID';
+with me as (select id from auth.users where lower(email) = lower('YOUR_EMAIL_HERE'))
+delete from public.daily_tasks dt using me where dt.user_id = me.id;
+
+with me as (select id from auth.users where lower(email) = lower('YOUR_EMAIL_HERE'))
+delete from public.user_progress up using me where up.user_id = me.id;
