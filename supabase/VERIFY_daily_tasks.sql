@@ -11,16 +11,19 @@
 -- Tells you in one row whether the migration has been applied yet.
 -- ============================================================================
 
+-- Reads only the catalog, so it works no matter what does or does not exist.
 select
-  to_regclass('public.user_progress') is not null                as migration_applied,
-  (select count(*) from pg_proc p join pg_namespace n on n.oid = p.pronamespace
-     where n.nspname = 'public' and p.proname = 'generate_daily_tasks')  as generator_fns,
-  (select count(*) from public.task_templates
-     where active and status = 'PUBLISHED')                      as seeded_templates;
+  to_regclass('public.user_progress')  is not null as migration_applied,
+  to_regclass('public.task_templates') is not null as templates_table_exists,
+  to_regclass('public.daily_tasks')    is not null as daily_tasks_table_exists,
+  (select count(*) from pg_proc p
+     join pg_namespace n on n.oid = p.pronamespace
+   where n.nspname = 'public' and p.proname = 'generate_daily_tasks') as generator_fns;
 
--- migration_applied = false  -> go do STEP 2. Nothing else will work.
--- migration_applied = true, generator_fns = 1, seeded_templates = 30 -> ready.
--- generator_fns = 2 -> an old overload survived; see note under STEP 3b.
+-- migration_applied = false  -> go do STEP 2. Nothing else in this file works
+--                               until that is true.
+-- migration_applied = true and generator_fns = 1 -> ready, continue at STEP 3.
+-- generator_fns = 2 -> an old overload survived; see the note under STEP 3b.
 
 
 -- ============================================================================
