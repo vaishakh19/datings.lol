@@ -31,10 +31,11 @@ React/Vite frontend, Express API, Supabase authentication and persistence, Gemin
    supabase db push
    ```
 
-   Alternatively, paste each migration into the Supabase SQL Editor in timestamp order. The billing migration is:
+   Alternatively, paste each migration into the Supabase SQL Editor in timestamp order. The billing migrations are:
 
    ```text
    supabase/migrations/20261011000000_dodo_test_billing.sql
+   supabase/migrations/20261011120000_dodo_preserve_grace_deadline.sql
    ```
 
 4. For local UI development without Supabase or billing, set `ALLOW_DEMO_MODE=true`, leave all Dodo variables unset, and run:
@@ -58,6 +59,8 @@ The billing migration is additive. It extends `subscriptions` and creates:
 - `begin_dodo_checkout`, `process_dodo_subscription_event`, `record_dodo_webhook_event`, and `try_consume_coach_quota` RPCs
 
 The RPCs are `SECURITY DEFINER`, use an empty search path, and are executable only by `service_role`. The browser has no write grants on billing tables.
+
+`20261011120000_dodo_preserve_grace_deadline.sql` adds the `subscriptions_preserve_dodo_grace_deadline` trigger. Dodo returns the grace-period deadline (`past_due_ends_at`) only inside the signed webhook payload, never from the subscription REST API, and the server re-reads the subscription for `payment.*`, `refund.*`, and `dispute.*` events. The trigger keeps the already-verified deadline when such a snapshot omits it, so an out-of-order `payment.failed` cannot cut a paid grace period short. It never writes a deadline Dodo did not sign, and it changes no existing rows.
 
 After applying the migration, these read-only checks should return table/function names:
 
@@ -158,7 +161,7 @@ Verified events are claimed by `webhook-id` in the same database transaction tha
 A subscription is associated only through signed metadata or an already verified Dodo subscription/customer mapping. Unexpected products, unknown users, identity conflicts, and second active subscriptions are quarantined with a short diagnostic code and do not change access.
 
 - `active` and current-period subscriptions grant Pro.
-- `past_due` grants access only through Dodo's signed `past_due_ends_at` value.
+- `past_due` grants access only through Dodo's signed `past_due_ends_at` value. That deadline is preserved across later re-reads that do not carry it (see the grace-deadline migration above), and a `past_due` row without a deadline is never treated as Pro.
 - scheduled cancellation grants access only through the paid-through period end.
 - `on_hold`, `paused`, `failed`, `expired`, and revoked states deny access.
 - a full successful refund revokes; a partial or failed refund is recorded without revocation.
@@ -212,6 +215,17 @@ The billing tests cover fail-closed configuration, hosted URL allowlists, exact 
 
 These tests do not contact Dodo or a hosted Supabase project. Provider-hosted checkout and webhook delivery must still be tested manually with real **test-mode** credentials.
 
+### Optional database integration harness
+
+The vitest suite cannot prove how the SQL RPCs behave, so `server/db-tests/` carries an opt-in harness that boots a throwaway PostgreSQL cluster, applies `supabase/schema.sql` plus every migration in timestamp order, then drives the real RPCs and re-checks the rows with the real `deriveEntitlement()` policy. It needs no Dodo or Supabase credentials.
+
+```bash
+cd server/db-tests && npm install && cd ../..
+npm run test:billing-db
+```
+
+It covers checkout reservation reuse, duplicate-delivery idempotency, stale-event ordering, the grace window, scheduled cancellation, quarantine of unexpected products and conflicting identities, revocation overrides, concurrent coach-quota consumption, and the `authenticated` privilege wall. It deliberately stays out of `npm test` because it downloads its own PostgreSQL binaries.
+
 ## Manual TEST MODE runbook
 
 Use a dedicated test user with a confirmed email. Never use a real card.
@@ -247,6 +261,7 @@ Use these documented Dodo test cards:
 - Leaving via Dodo's cancel/back action must show a canceled UI state without changing entitlement. The existing checkout reservation remains reusable to prevent duplicates.
 - Open **Manage / cancel in Dodo**, schedule cancellation, and verify access remains only until Dodo's paid-through date.
 - To test renewal failure, first subscribe with the success card, switch the payment method in the Customer Portal to the renewal-failure card, then use Dodo's test tooling/API to move `next_billing_date`. Confirm the signed lifecycle events produce the expected grace/on-hold behavior.
+- Dodo's grace period is **off by default**, so a failed renewal goes straight to `subscription.on_hold`. To exercise `past_due`/`past_due_ends_at`, enable **Settings → Subscriptions → Subscription Grace Period** in Dodo Test Mode first. Confirm Pro access survives `subscription.past_due` and is revoked at the deadline (or earlier on `on_hold`).
 
 ### Refunds, disputes, retries, and ordering
 

@@ -1,0 +1,16 @@
+{
+  "name": "datings-lol-billing-db-tests",
+  "private": true,
+  "type": "module",
+  "description": "Opt-in integration harness: applies the Supabase migrations to a throwaway Postgres and exercises the Dodo billing state machine.",
+  "scripts": {
+    "test": "cd ../.. && npx tsx server/db-tests/billing-db-integration.ts"
+  },
+  "dependencies": {
+    "embedded-postgres": "^18.4.0-beta.17",
+    "pg": "^8.13.1"
+  },
+  "devDependencies": {
+    "@types/pg": "^8.11.10"
+  }
+}

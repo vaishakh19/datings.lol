@@ -1,4 +1,4 @@
-import { readFileSync } from 'node:fs';
+import { readFileSync, readdirSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { dirname, resolve } from 'node:path';
 import { describe, expect, it } from 'vitest';
@@ -10,6 +10,14 @@ const migrationSource = readFileSync(
   resolve(root, 'supabase/migrations/20261011000000_dodo_test_billing.sql'),
   'utf8',
 );
+const graceMigrationName = '20261011120000_dodo_preserve_grace_deadline.sql';
+const graceMigrationSource = readFileSync(
+  resolve(root, 'supabase/migrations', graceMigrationName),
+  'utf8',
+);
+const migrationNames = readdirSync(resolve(root, 'supabase/migrations'))
+  .filter((name) => name.endsWith('.sql'))
+  .sort();
 
 describe('billing integration safety rails', () => {
   it('mounts the raw webhook route before the global JSON parser', () => {
@@ -102,5 +110,37 @@ describe('billing migration invariants', () => {
     expect(migrationSource).toContain("diagnostic_code = 'unexpected_product'");
     expect(migrationSource).toContain("diagnostic_code = 'unmatched_user'");
     expect(migrationSource).toContain("diagnostic_code = 'duplicate_active_subscription'");
+  });
+});
+
+describe('grace-period deadline durability', () => {
+  it('keeps the Dodo-signed deadline when a REST snapshot omits the field', () => {
+    // Dodo's subscription REST API does not return past_due_ends_at, and the
+    // server re-reads subscriptions for payment.*, refund.*, and dispute.*
+    // events. Without this guard a re-read would null out a verified deadline.
+    expect(graceMigrationSource).toMatch(/new\.past_due_ends_at is null/);
+    expect(graceMigrationSource).toMatch(/new\.past_due_ends_at := old\.past_due_ends_at/);
+    expect(graceMigrationSource).toContain("new.provider = 'dodo'");
+    expect(graceMigrationSource).toContain("old.provider = 'dodo'");
+    expect(graceMigrationSource).toContain('before update on public.subscriptions');
+  });
+
+  it('cannot invent a deadline and adds no privilege-escalation surface', () => {
+    // The guard only ever copies an existing signed value, never a new one, and
+    // it is not a SECURITY DEFINER function (so it cannot be used to bypass the
+    // service-role locks the billing RPCs rely on).
+    expect(graceMigrationSource).not.toContain('security definer');
+    expect(graceMigrationSource).not.toMatch(/new\.past_due_ends_at := (?!old\.)/);
+    expect(graceMigrationSource).toContain(
+      'revoke all on function public.preserve_dodo_grace_deadline() from public, anon, authenticated;',
+    );
+  });
+
+  it('is applied after the billing migration it depends on', () => {
+    expect(migrationNames).toContain('20261011000000_dodo_test_billing.sql');
+    expect(migrationNames).toContain(graceMigrationName);
+    expect(migrationNames.indexOf(graceMigrationName)).toBeGreaterThan(
+      migrationNames.indexOf('20261011000000_dodo_test_billing.sql'),
+    );
   });
 });

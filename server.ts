@@ -1203,6 +1203,11 @@ async function applyVerifiedSubscriptionSnapshot(
     });
   }
 
+  // `pastDueEndsAt` is null for REST re-reads on purpose: Dodo only returns the
+  // grace deadline inside the signed webhook payload. The
+  // subscriptions_preserve_dodo_grace_deadline trigger keeps the previously
+  // signed value instead of overwriting it, so an out-of-order payment.* event
+  // cannot shorten a paid grace window.
   const { data, error } = await sb().rpc('process_dodo_subscription_event', {
     p_webhook_id: context.webhookId,
     p_event_type: context.eventType,
