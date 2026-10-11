@@ -1,12 +1,33 @@
-import React from "react";
-import { Crown, Check, X } from "lucide-react";
+import React, { useState } from "react";
+import { Crown, Check, LoaderCircle, X } from "lucide-react";
 
 interface ProModalProps {
   onClose: () => void;
-  onUpgrade: () => void;
+  onUpgrade: () => Promise<void>;
+  proDailyLimit: number;
+  billingConfigured: boolean;
+  error?: string;
 }
 
-export const ProModal: React.FC<ProModalProps> = ({ onClose, onUpgrade }) => {
+export const ProModal: React.FC<ProModalProps> = ({
+  onClose,
+  onUpgrade,
+  proDailyLimit,
+  billingConfigured,
+  error,
+}) => {
+  const [loading, setLoading] = useState(false);
+
+  const startCheckout = async () => {
+    if (loading || !billingConfigured) return;
+    setLoading(true);
+    try {
+      await onUpgrade();
+    } finally {
+      setLoading(false);
+    }
+  };
+
   return (
     <div className="fixed inset-0 z-[60] flex items-end sm:items-center justify-center p-4">
       <div
@@ -21,16 +42,18 @@ export const ProModal: React.FC<ProModalProps> = ({ onClose, onUpgrade }) => {
             </div>
             <div>
               <div className="font-black text-[20px] leading-none tracking-tighter">
-                Out of roasts today
+                More coaching, same honesty
               </div>
               <div className="text-[12px] font-bold opacity-60 uppercase tracking-widest">
-                Free = 3 per day
+                Free = 3 chats per day
               </div>
             </div>
           </div>
           <button
+            type="button"
             onClick={onClose}
             className="w-8 h-8 bg-white border-[2.5px] border-black rounded-full flex items-center justify-center"
+            aria-label="Close Pro upgrade"
           >
             <X size={16} strokeWidth={3} />
           </button>
@@ -41,43 +64,51 @@ export const ProModal: React.FC<ProModalProps> = ({ onClose, onUpgrade }) => {
             <div className="w-7 h-7 bg-[#BEF264] border-[2px] border-black rounded-full flex items-center justify-center">
               <Crown size={14} className="text-black" />
             </div>
-            <span className="font-black text-[14px]">
-              Pro gets unlimited photo roasts
-            </span>
+            <span className="font-black text-[14px]">Pro • $9/month</span>
           </div>
           <ul className="space-y-2 text-[13px] font-medium">
             <li className="flex gap-2">
               <Check size={14} className="mt-0.5 shrink-0" strokeWidth={3} />
-              Unlimited chat + photo upload roasts
+              Up to {proDailyLimit} AI Coach chats per day
             </li>
             <li className="flex gap-2">
               <Check size={14} className="mt-0.5 shrink-0" strokeWidth={3} />
-              Profile roast report (photos, prompts, bio)
+              Chat and photo coaching within that allowance
             </li>
             <li className="flex gap-2">
               <Check size={14} className="mt-0.5 shrink-0" strokeWidth={3} />
-              All lessons unlocked + streak freeze
+              Hosted billing management and cancellation
             </li>
           </ul>
         </div>
 
+        {(!billingConfigured || error) && (
+          <div className="mb-3 bg-[#FDA4AF] border-[2px] border-black rounded-[14px] p-3 text-[11px] font-bold">
+            {error || "Test checkout is not configured yet. Add the server billing variables first."}
+          </div>
+        )}
+
         <div className="grid grid-cols-2 gap-3">
           <button
+            type="button"
             onClick={onClose}
             className="h-[48px] bg-white border-[3px] border-black rounded-full font-black text-[13px] uppercase"
           >
             Maybe later
           </button>
           <button
-            onClick={onUpgrade}
-            className="h-[48px] bg-[#FFE066] border-[3px] border-black rounded-full font-black text-[13px] uppercase brutal-shadow-sm flex items-center justify-center gap-1"
+            type="button"
+            onClick={() => void startCheckout()}
+            disabled={loading || !billingConfigured}
+            className="h-[48px] bg-[#FFE066] border-[3px] border-black rounded-full font-black text-[13px] uppercase brutal-shadow-sm flex items-center justify-center gap-1 disabled:opacity-50 disabled:shadow-none"
           >
-            <Crown size={14} /> Upgrade $9/mo
+            {loading ? <LoaderCircle size={15} className="animate-spin" /> : <Crown size={14} />}
+            {loading ? "Opening…" : "Upgrade $9/mo"}
           </button>
         </div>
 
-        <p className="text-[10px] font-bold opacity-40 uppercase tracking-widest text-center mt-3">
-          Mock checkout • Instant unlock • No AI label
+        <p className="text-[9px] font-bold opacity-50 uppercase tracking-widest text-center mt-3 leading-relaxed">
+          Dodo Payments test mode • Pro starts only after a verified webhook
         </p>
       </div>
     </div>

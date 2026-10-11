@@ -107,7 +107,9 @@ export function normalizeUserAppState(value: unknown): UserAppState {
     messages: safeArray<ChatMessage>(value.messages, defaults.messages),
     avatarUrl: typeof value.avatarUrl === "string" ? value.avatarUrl : null,
     screenshots: safeArray<string>(value.screenshots),
-    isPro: value.isPro === true,
+    // Billing state is never hydrated from the browser-writable JSON payload.
+    // App.tsx reconciles it exclusively through the authenticated billing API.
+    isPro: false,
     chatsUsedToday:
       typeof value.chatsUsedToday === "number" && Number.isFinite(value.chatsUsedToday)
         ? Math.max(0, Math.floor(value.chatsUsedToday))
@@ -189,7 +191,8 @@ export function readLegacyUserAppState(userId: string): UserAppState | null {
     if (messages?.length) state.messages = messages;
     state.avatarUrl = avatarUrl;
     state.screenshots = screenshots;
-    state.isPro = localStorage.getItem("datings_isPro") === "true";
+    // Legacy local Pro flags were simulated and are intentionally not imported.
+    state.isPro = false;
     state.chatsUsedToday = Number(localStorage.getItem("datings_chatCountToday")) || 0;
     state.lastChatDate = localStorage.getItem("datings_lastChatDate") || "";
     state.lastHotTakeDate = localStorage.getItem("datings_last_hottake_date") || "";
