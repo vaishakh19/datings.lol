@@ -54,6 +54,8 @@ interface CoachTabProps {
 
   maxFreeChats: number;
 
+  maxDailyChats: number;
+
   onOpenProModal: () => void;
 
   onNewSession?: () => void;
@@ -76,14 +78,6 @@ export type CoachMode =
   | "gentle"
   | "direct"
   | "brutal";
-
-
-type LocalMessage = {
-  id: string;
-  role: "user" | "coach";
-  text: string;
-  imageUrl?: string;
-};
 
 
 /* =========================================================
@@ -191,167 +185,6 @@ function formatCoachText(
 
 
 /* =========================================================
-   LOCAL COACH RESPONSE
-   Temporary until real API is connected.
-========================================================= */
-
-function generateLocalCoachReply(
-  text: string,
-  mode: CoachMode
-): string {
-  const lower = text.toLowerCase();
-
-  if (
-    lower.includes("text back") ||
-    lower.includes("what should i text")
-  ) {
-    return `COACH'S TAKE
-
-Don't over-engineer the reply.
-
-Send something specific to what they actually said instead of trying to sound impressive.
-
-Try:
-"okay wait, now I'm curious — what made you say that? 👀"
-
-Keep it easy to answer.`;
-
-  }
-
-  if (
-    lower.includes("read") ||
-    lower.includes("replied") ||
-    lower.includes("reply")
-  ) {
-    return `COACH'S TAKE
-
-Don't panic over one slow reply.
-
-The move right now is to avoid sending another message just to get reassurance.
-
-Give the conversation some space.
-
-If they come back, continue normally instead of mentioning the delay.`;
-
-  }
-
-  if (
-    lower.includes("ask them out") ||
-    lower.includes("ask her out") ||
-    lower.includes("ask him out")
-  ) {
-    return `COACH'S TAKE
-
-Stop waiting for the perfect moment.
-
-If you've already built some conversation, make the invitation simple and specific.
-
-Try:
-
-"you seem fun to talk to — want to grab coffee sometime this week?"
-
-Clear. Low pressure. Easy to answer.`;
-
-  }
-
-  if (
-    lower.includes("nervous") ||
-    lower.includes("scared") ||
-    lower.includes("anxious")
-  ) {
-    return `COACH'S TAKE
-
-You don't need to eliminate the nerves before making a move.
-
-Your goal is simply to make the next small action.
-
-Don't think about the entire interaction.
-
-Think:
-
-"What's one honest thing I can say right now?"
-
-That's enough.`;
-
-  }
-
-  if (
-    lower.includes("profile") ||
-    lower.includes("bio") ||
-    lower.includes("dating profile")
-  ) {
-    return `COACH'S TAKE
-
-Your profile should make it easy for someone to start a conversation with you.
-
-Focus on three things:
-
-1. One clear personality signal.
-2. One specific interest.
-3. One easy conversation hook.
-
-Avoid turning your bio into a list of generic traits.`;
-
-  }
-
-  if (
-    lower.includes("mixed signal") ||
-    lower.includes("situationship") ||
-    lower.includes("distant")
-  ) {
-    return `COACH'S TAKE
-
-Don't try to decode every tiny signal.
-
-Look at the pattern:
-
-Are they initiating?
-Are they making time?
-Do their actions match what they say?
-
-Consistency tells you more than one message.
-
-For now, respond to what they actually do rather than guessing what they might mean.`;
-
-  }
-
-  if (mode === "gentle") {
-    return `COACH'S TAKE
-
-First, don't beat yourself up.
-
-There's probably a simpler next step here than your brain is making it feel.
-
-Tell me what happened, what they said, and what you want to happen next.`;
-  }
-
-  if (mode === "brutal") {
-    return `COACH'S TAKE
-
-Here's the blunt version:
-
-You're probably spending more time analysing the situation than actually moving it forward.
-
-Stop trying to find certainty from tiny signals.
-
-Give me the exact situation and we'll find the next move.`;
-  }
-
-  return `COACH'S TAKE
-
-Let's simplify this.
-
-I need three things:
-
-• What happened?
-• What did they say or do?
-• What do you want to happen next?
-
-Give me those and I'll help you decide the next move.`;
-}
-
-
-/* =========================================================
    COACH TAB
 ========================================================= */
 
@@ -362,6 +195,7 @@ export const CoachTab: React.FC<CoachTabProps> = ({
   isPro,
   chatsUsedToday,
   maxFreeChats,
+  maxDailyChats,
   onOpenProModal,
   onNewSession,
   onMessageFeedback,
@@ -438,14 +272,6 @@ export const CoachTab: React.FC<CoachTabProps> = ({
     useState(false);
 
 
-  const [uploadedImage, setUploadedImage] =
-    useState<string | null>(null);
-
-
-  const [localMessages, setLocalMessages] =
-    useState<LocalMessage[]>([]);
-
-
   const fileInputRef =
     useRef<HTMLInputElement>(null);
 
@@ -462,17 +288,33 @@ export const CoachTab: React.FC<CoachTabProps> = ({
      LIMIT
   ======================================================= */
 
+  const activeDailyLimit =
+    isPro
+      ? maxDailyChats
+      : maxFreeChats;
+
+
   const isLimitReached =
-    !isPro &&
-    chatsUsedToday >= maxFreeChats;
+    chatsUsedToday >= activeDailyLimit;
 
 
   const remaining =
     Math.max(
       0,
-      maxFreeChats -
+      activeDailyLimit -
         chatsUsedToday
     );
+
+
+  const handleLimitReached = () => {
+    if (!isPro) {
+      onOpenProModal();
+      return;
+    }
+    setStatusNotice(
+      "Your Pro Coach allowance resets at 00:00 UTC."
+    );
+  };
 
 
   /* =======================================================
@@ -510,7 +352,6 @@ export const CoachTab: React.FC<CoachTabProps> = ({
     });
   }, [
     messages,
-    localMessages,
     isTyping,
   ]);
 
@@ -539,70 +380,17 @@ export const CoachTab: React.FC<CoachTabProps> = ({
 
 
     if (isLimitReached) {
-      onOpenProModal();
+      handleLimitReached();
       return;
     }
 
 
-    const localUserMessage: LocalMessage = {
-      id:
-        `local-user-${Date.now()}`,
-      role: "user",
-      text,
-    };
-
-
-    setLocalMessages(
-      (current) => [
-        ...current,
-        localUserMessage,
-      ]
-    );
-
-
     setInputText("");
-
-
-    /*
-     * TEMPORARY LOCAL COACH
-     *
-     * We intentionally don't depend on
-     * the API yet.
-     */
-
-    setTimeout(() => {
-
-      const reply =
-        generateLocalCoachReply(
-          text,
-          mode
-        );
-
-
-      setLocalMessages(
-        (current) => [
-          ...current,
-          {
-            id:
-              `local-coach-${Date.now()}`,
-            role: "coach",
-            text: reply,
-          },
-        ]
-      );
-
-    }, 500);
-
-
-    /*
-     * Keep the real callback available.
-     *
-     * When you're ready for API,
-     * remove the local response above
-     * and use this callback.
-     *
-     * await onSendMessage(text, undefined, mode);
-     */
+    await onSendMessage(
+      text,
+      undefined,
+      mode
+    );
   };
 
 
@@ -615,7 +403,7 @@ export const CoachTab: React.FC<CoachTabProps> = ({
   ) => {
 
     if (isLimitReached) {
-      onOpenProModal();
+      handleLimitReached();
       return;
     }
 
@@ -646,7 +434,7 @@ export const CoachTab: React.FC<CoachTabProps> = ({
     }
 
 
-    if (!file) {
+    if (!file || isTyping) {
       return;
     }
 
@@ -665,7 +453,7 @@ export const CoachTab: React.FC<CoachTabProps> = ({
 
 
     if (isLimitReached) {
-      onOpenProModal();
+      handleLimitReached();
       return;
     }
 
@@ -680,46 +468,11 @@ export const CoachTab: React.FC<CoachTabProps> = ({
         );
 
 
-      setUploadedImage(dataUrl);
-
-
-      setLocalMessages(
-        (current) => [
-          ...current,
-          {
-            id:
-              `image-${Date.now()}`,
-            role: "user",
-            text:
-              "Analyze this screenshot.",
-            imageUrl: dataUrl,
-          },
-        ]
+      await onSendMessage(
+        undefined,
+        dataUrl,
+        mode
       );
-
-
-      setTimeout(() => {
-
-        setLocalMessages(
-          (current) => [
-            ...current,
-            {
-              id:
-                `image-coach-${Date.now()}`,
-              role: "coach",
-              text:
-                `COACH'S TAKE
-
-I can see the screenshot.
-
-For now, API analysis isn't connected, but the upload pipeline is working.
-
-When we connect the AI API, this exact screenshot will be sent to the coach for conversation analysis.`,
-            },
-          ]
-        );
-
-      }, 600);
 
     } catch {
 
@@ -737,11 +490,7 @@ When we connect the AI API, this exact screenshot will be sent to the coach for 
 
   const handleNewSession = () => {
 
-    setLocalMessages([]);
-
     setInputText("");
-
-    setUploadedImage(null);
 
     setPracticeMessages([]);
 
@@ -859,23 +608,19 @@ When we connect the AI API, this exact screenshot will be sent to the coach for 
      RENDERED MESSAGES
   ======================================================= */
 
-  const renderedMessages = [
-    ...messages.map(
-      (message) => ({
-        id: message.id,
-        role:
-          message.role === "user"
-            ? "user"
-            : "coach",
-        text:
-          message.text || "",
-        imageUrl:
-          message.imageUrl,
-      })
-    ),
-
-    ...localMessages,
-  ];
+  const renderedMessages = messages.map(
+    (message) => ({
+      id: message.id,
+      role:
+        message.role === "user"
+          ? "user"
+          : "coach",
+      text:
+        message.text || "",
+      imageUrl:
+        message.imageUrl,
+    })
+  );
 
 
   /* =======================================================
@@ -1037,8 +782,8 @@ When we connect the AI API, this exact screenshot will be sent to the coach for 
           <span className="font-black text-[10px] uppercase tracking-widest truncate">
 
             {isPro
-              ? "Unlimited coaching"
-              : `Free: ${remaining}/${maxFreeChats} left today`}
+              ? `Pro: ${remaining}/${activeDailyLimit} left today`
+              : `Free: ${remaining}/${activeDailyLimit} left today`}
 
           </span>
 
@@ -1090,21 +835,25 @@ When we connect the AI API, this exact screenshot will be sent to the coach for 
             </div>
 
             <div className="text-[10px] font-bold">
-              Your next free coaching session unlocks tomorrow.
+              {isPro
+                ? "Your Pro allowance resets at 00:00 UTC."
+                : "Your next free coaching session unlocks at 00:00 UTC."}
             </div>
 
           </div>
 
 
-          <button
-            type="button"
-            onClick={
-              onOpenProModal
-            }
-            className="bg-white border-[2px] border-black rounded-full px-3 py-1.5 font-black text-[9px] uppercase"
-          >
-            See plans
-          </button>
+          {!isPro && (
+            <button
+              type="button"
+              onClick={
+                onOpenProModal
+              }
+              className="bg-white border-[2px] border-black rounded-full px-3 py-1.5 font-black text-[9px] uppercase"
+            >
+              See plans
+            </button>
+          )}
 
         </div>
 

@@ -29,6 +29,27 @@ import { pinoHttp } from 'pino-http';
 import { z } from 'zod';
 import { createClient, SupabaseClient } from '@supabase/supabase-js';
 import { GoogleGenAI, Content } from '@google/genai';
+import {
+  DISPUTE_WEBHOOK_TYPES,
+  PAYMENT_WEBHOOK_TYPES,
+  REFUND_WEBHOOK_TYPES,
+  SUBSCRIPTION_WEBHOOK_TYPES,
+  BillingConfig,
+  UserEntitlement,
+  billingCancelUrl,
+  billingPortalReturnUrl,
+  billingReturnUrl,
+  createDodoTestClient,
+  deriveEntitlement,
+  firstSubscriptionId,
+  isSafeDodoPortalUrl,
+  isSafeTestCheckoutUrl,
+  metadataUserId,
+  parseBillingConfig,
+  subscriptionSnapshot,
+  validEventTimestamp,
+  validateProProduct,
+} from './server/billing.js';
 
 // ============================================================================
 // CONFIGURATION (validated — the server refuses to boot with a bad env)
@@ -45,8 +66,17 @@ const envSchema = z.object({
   VITE_SUPABASE_URL: z.string().url().optional(),
 
   GEMINI_API_KEY: z.string().optional(),
-  COACH_FREE_DAILY_LIMIT: z.coerce.number().int().min(1).max(1000).default(3),
+  COACH_PRO_DAILY_LIMIT: z.coerce.number().int().min(4).max(10000).default(100),
   COACH_XP_REWARD: z.coerce.number().int().min(0).max(1000).default(20),
+
+  // Billing is optional until configured, but if any value is supplied the
+  // complete test-mode set is validated below. Secrets are server-only.
+  DODO_PAYMENTS_API_KEY: z.string().optional(),
+  DODO_PAYMENTS_WEBHOOK_KEY: z.string().optional(),
+  DODO_PAYMENTS_PRODUCT_ID: z.string().optional(),
+  DODO_PAYMENTS_ENVIRONMENT: z.string().optional(),
+  DODO_PAYMENTS_BASE_URL: z.string().optional(),
+  APP_URL: z.string().optional(),
 
   ALLOW_DEMO_MODE: z.enum(['true', 'false']).default('false'),
   ENABLE_CSP: z.enum(['true', 'false']).default('false'),
@@ -87,6 +117,17 @@ const SUPABASE_URL = env.SUPABASE_URL ?? env.VITE_SUPABASE_URL ?? null;
 const SUPABASE_SERVICE_ROLE_KEY = env.SUPABASE_SERVICE_ROLE_KEY ?? null;
 const GEMINI_API_KEY =
   env.GEMINI_API_KEY && env.GEMINI_API_KEY !== 'MY_GEMINI_API_KEY' ? env.GEMINI_API_KEY : null;
+// The public Free plan is intentionally fixed. Only the finite Pro ceiling is configurable.
+const COACH_FREE_DAILY_LIMIT = 3;
+const billingState = parseBillingConfig(process.env, isProd);
+const billingConfig: BillingConfig | null = billingState.config;
+
+// A totally absent billing configuration keeps unrelated features available.
+// Partial, live-mode, or otherwise unsafe billing configuration is a startup
+// error rather than an implicit fallback.
+if (billingState.problem && billingState.missing.length < 5) {
+  fatal(billingState.problem);
+}
 
 if (isProd && demoMode) {
   fatal('ALLOW_DEMO_MODE must be false when NODE_ENV=production.');
@@ -101,8 +142,30 @@ if (!demoMode && (!SUPABASE_URL || !SUPABASE_SERVICE_ROLE_KEY)) {
 
 const logger = pino({
   level: env.LOG_LEVEL,
-  redact: { paths: ['req.headers.authorization', 'req.headers.cookie'], censor: '[REDACTED]' },
+  redact: {
+    paths: [
+      'req.headers.authorization',
+      'req.headers.cookie',
+      'req.headers.webhook-signature',
+      'apiKey',
+      'webhookKey',
+    ],
+    censor: '[REDACTED]',
+  },
 });
+
+if (!billingConfig) {
+  logger.warn({ missing: billingState.missing }, 'Dodo Payments test billing is disabled until configured');
+}
+
+let dodoClient: ReturnType<typeof createDodoTestClient> | null = null;
+function dodo() {
+  if (!billingConfig) {
+    throw new ApiError(503, 'Billing is not configured.', 'BILLING_NOT_CONFIGURED');
+  }
+  if (!dodoClient) dodoClient = createDodoTestClient(billingConfig);
+  return dodoClient;
+}
 
 // ============================================================================
 // TYPES
@@ -302,7 +365,7 @@ const tokenCache = new Map<string, CachedAuth>();
 const TOKEN_CACHE_TTL_MS = 5 * 60 * 1000;
 let warnedDemoAuth = false;
 
-async function getAuthenticatedUserId(req: Request): Promise<string | null> {
+async function getAuthenticatedUserId(req: Request, requireFreshVerification = false): Promise<string | null> {
   const authorization = req.header('authorization');
   if (!authorization?.startsWith('Bearer ')) return null;
   const token = authorization.slice(7).trim();
@@ -310,7 +373,7 @@ async function getAuthenticatedUserId(req: Request): Promise<string | null> {
 
   const cacheKey = crypto.createHash('sha256').update(token).digest('hex');
   const cached = tokenCache.get(cacheKey);
-  if (cached && cached.expiresAt > Date.now()) return cached.userId;
+  if (!requireFreshVerification && cached && cached.expiresAt > Date.now()) return cached.userId;
 
   if (SUPABASE_URL && SUPABASE_SERVICE_ROLE_KEY) {
     const { data, error } = await sb().auth.getUser(token);
@@ -332,8 +395,12 @@ async function getAuthenticatedUserId(req: Request): Promise<string | null> {
   return null;
 }
 
-async function requireAuth(req: Request, res: Response): Promise<string | null> {
-  const userId = await getAuthenticatedUserId(req);
+async function requireAuth(
+  req: Request,
+  res: Response,
+  requireFreshVerification = false,
+): Promise<string | null> {
+  const userId = await getAuthenticatedUserId(req, requireFreshVerification);
   if (!userId) {
     res.status(401).json({ error: 'Authentication required.' });
     return null;
@@ -370,6 +437,33 @@ async function requireAdmin(req: Request, res: Response): Promise<string | null>
     return null;
   }
   return userId;
+}
+
+/** Authoritative, server-side plan and quota policy used by every paid feature. */
+async function getUserEntitlement(userId: string): Promise<UserEntitlement> {
+  if (demoMode) {
+    return deriveEntitlement(null, COACH_FREE_DAILY_LIMIT, env.COACH_PRO_DAILY_LIMIT);
+  }
+
+  const { data, error } = await sb()
+    .from('subscriptions')
+    .select(
+      'user_id, plan, provider, status, provider_customer_id, provider_subscription_id, provider_product_id, current_period_start, current_period_end, past_due_ends_at, cancel_at_period_end',
+    )
+    .eq('user_id', userId)
+    .maybeSingle();
+  if (error) {
+    logger.error({ err: error, userId }, 'subscription entitlement lookup failed');
+    throw new ApiError(503, 'Billing entitlement service unavailable.', 'BILLING_DATABASE_NOT_READY');
+  }
+
+  return deriveEntitlement(
+    data as any,
+    COACH_FREE_DAILY_LIMIT,
+    env.COACH_PRO_DAILY_LIMIT,
+    new Date(),
+    billingConfig?.productId,
+  );
 }
 
 /** Atomic XP + streak update (never a read-then-write race). */
@@ -994,14 +1088,7 @@ function createSupabaseStore(): DataStore {
     },
     coach: {
       async getPlan(userId) {
-        const { data, error } = await sb()
-          .from('subscriptions')
-          .select('plan, status')
-          .eq('user_id', userId)
-          .eq('status', 'active')
-          .maybeSingle();
-        if (error || !data) return 'free';
-        return data.plan === 'pro' ? 'pro' : 'free';
+        return (await getUserEntitlement(userId)).plan;
       },
       async consumeQuota(userId, limit) {
         // Atomically increments the daily counter only when under the limit —
@@ -1014,19 +1101,20 @@ function createSupabaseStore(): DataStore {
         return Boolean(data);
       },
       async usageToday(userId) {
-        const { count, error } = await sb()
-          .from('coach_usage')
-          .select('*', { count: 'exact', head: true })
+        const { data, error } = await sb()
+          .from('coach_daily_usage')
+          .select('messages_used')
           .eq('user_id', userId)
-          .gte('created_at', startOfTodayIso());
+          .eq('usage_date', todayKey())
+          .maybeSingle();
         if (error) {
           logger.warn({ err: error, userId }, 'coach usage lookup failed');
           return 0;
         }
-        return count || 0;
+        return Number(data?.messages_used || 0);
       },
       async recordUsage(userId, plan, model, inputTokens, outputTokens, totalTokens) {
-        const { error } = await sb().from('coach_usage').insert({
+        const { error } = await sb().from('coach_request_log').insert({
           user_id: userId,
           plan,
           model,
@@ -1065,6 +1153,254 @@ function createSupabaseStore(): DataStore {
 }
 
 const store: DataStore = demoMode ? createMemoryStore() : createSupabaseStore();
+
+// ============================================================================
+// DODO WEBHOOK PROCESSING (verified raw payload -> one atomic Supabase RPC)
+// ============================================================================
+
+interface VerifiedWebhookContext {
+  webhookId: string;
+  eventType: string;
+  eventTimestamp: string;
+  payloadHash: string;
+}
+
+async function recordVerifiedDodoEvent(
+  context: VerifiedWebhookContext,
+  options: {
+    subscriptionId?: string | null;
+    userId?: string | null;
+    status?: 'processed' | 'ignored' | 'quarantined';
+    diagnostic?: string | null;
+  } = {},
+): Promise<string> {
+  const { data, error } = await sb().rpc('record_dodo_webhook_event', {
+    p_webhook_id: context.webhookId,
+    p_event_type: context.eventType,
+    p_event_timestamp: context.eventTimestamp,
+    p_payload_sha256: context.payloadHash,
+    p_provider_subscription_id: options.subscriptionId ?? null,
+    p_user_id: options.userId ?? null,
+    p_processing_status: options.status ?? 'ignored',
+    p_diagnostic_code: options.diagnostic ?? null,
+  });
+  if (error) throw error;
+  return String(data);
+}
+
+async function applyVerifiedSubscriptionSnapshot(
+  context: VerifiedWebhookContext,
+  rawSubscription: unknown,
+  userIdHint: string | null,
+  statusOverride?: 'revoked',
+): Promise<string> {
+  const snapshot = subscriptionSnapshot(rawSubscription);
+  if (!snapshot || !billingConfig) {
+    return recordVerifiedDodoEvent(context, {
+      userId: userIdHint,
+      status: 'quarantined',
+      diagnostic: !snapshot ? 'invalid_subscription_payload' : 'billing_not_configured',
+    });
+  }
+
+  const { data, error } = await sb().rpc('process_dodo_subscription_event', {
+    p_webhook_id: context.webhookId,
+    p_event_type: context.eventType,
+    p_event_timestamp: context.eventTimestamp,
+    p_payload_sha256: context.payloadHash,
+    p_user_id: userIdHint ?? snapshot.metadataUserId,
+    p_provider_customer_id: snapshot.providerCustomerId,
+    p_provider_subscription_id: snapshot.providerSubscriptionId,
+    p_provider_product_id: snapshot.providerProductId,
+    p_status: statusOverride ?? snapshot.status,
+    p_current_period_start: snapshot.currentPeriodStart,
+    p_current_period_end: snapshot.currentPeriodEnd,
+    p_past_due_ends_at: snapshot.pastDueEndsAt,
+    p_cancel_at_period_end: snapshot.cancelAtPeriodEnd,
+    p_expected_product_id: billingConfig.productId,
+  });
+  if (error) throw error;
+  return String(data);
+}
+
+async function syncDodoSubscriptionForEvent(
+  context: VerifiedWebhookContext,
+  subscriptionId: string,
+  userIdHint: string | null,
+  statusOverride?: 'revoked',
+): Promise<string> {
+  const subscription = await dodo().subscriptions.retrieve(subscriptionId);
+  return applyVerifiedSubscriptionSnapshot(context, subscription, userIdHint, statusOverride);
+}
+
+async function handleVerifiedDodoWebhook(event: any, context: VerifiedWebhookContext): Promise<string> {
+  if (SUBSCRIPTION_WEBHOOK_TYPES.has(event.type)) {
+    return applyVerifiedSubscriptionSnapshot(context, event.data, metadataUserId(event.data?.metadata));
+  }
+
+  if (PAYMENT_WEBHOOK_TYPES.has(event.type)) {
+    const subscriptionId = firstSubscriptionId(event.data);
+    const userId = metadataUserId(event.data?.metadata);
+    if (
+      subscriptionId &&
+      (event.type === 'payment.succeeded' || event.type === 'payment.failed')
+    ) {
+      // A payment event never grants access by itself. Re-read and persist the
+      // provider's current subscription snapshot instead.
+      return syncDodoSubscriptionForEvent(context, subscriptionId, userId);
+    }
+    return recordVerifiedDodoEvent(context, {
+      subscriptionId,
+      userId,
+      status: 'ignored',
+      diagnostic: subscriptionId ? 'payment_event_no_state_change' : 'non_subscription_payment',
+    });
+  }
+
+  if (REFUND_WEBHOOK_TYPES.has(event.type)) {
+    const userId = metadataUserId(event.data?.metadata);
+    if (event.type !== 'refund.succeeded' || event.data?.is_partial === true) {
+      return recordVerifiedDodoEvent(context, {
+        userId,
+        status: 'ignored',
+        diagnostic: event.data?.is_partial === true ? 'partial_refund' : 'refund_not_succeeded',
+      });
+    }
+
+    const paymentId = event.data?.payment_id;
+    if (typeof paymentId !== 'string' || !paymentId) {
+      return recordVerifiedDodoEvent(context, {
+        userId,
+        status: 'quarantined',
+        diagnostic: 'invalid_refund_payload',
+      });
+    }
+
+    // A full successful refund revokes the associated subscription locally.
+    // A later verified renewal/activation can restore it in event-time order.
+    const payment = await dodo().payments.retrieve(paymentId);
+    const subscriptionId = firstSubscriptionId(payment);
+    if (!subscriptionId) {
+      return recordVerifiedDodoEvent(context, {
+        userId,
+        status: 'ignored',
+        diagnostic: 'refunded_non_subscription_payment',
+      });
+    }
+    return syncDodoSubscriptionForEvent(
+      context,
+      subscriptionId,
+      userId ?? metadataUserId(payment.metadata),
+      'revoked',
+    );
+  }
+
+  if (DISPUTE_WEBHOOK_TYPES.has(event.type)) {
+    const paymentId = event.data?.payment_id;
+    if (typeof paymentId !== 'string' || !paymentId) {
+      return recordVerifiedDodoEvent(context, {
+        status: 'quarantined',
+        diagnostic: 'invalid_dispute_payload',
+      });
+    }
+
+    const payment = await dodo().payments.retrieve(paymentId);
+    const subscriptionId = firstSubscriptionId(payment);
+    const userId = metadataUserId(payment.metadata);
+    if (!subscriptionId) {
+      return recordVerifiedDodoEvent(context, {
+        userId,
+        status: 'ignored',
+        diagnostic: 'non_subscription_dispute',
+      });
+    }
+
+    // Access remains revoked while a dispute is open, challenged, expired,
+    // accepted, or lost. A verified won/cancelled event re-reads Dodo's current
+    // subscription state and may restore access in normal event-time order.
+    const mustRevoke = event.type !== 'dispute.won' && event.type !== 'dispute.cancelled';
+    return syncDodoSubscriptionForEvent(
+      context,
+      subscriptionId,
+      userId,
+      mustRevoke ? 'revoked' : undefined,
+    );
+  }
+
+  return recordVerifiedDodoEvent(context, {
+    status: 'ignored',
+    diagnostic: 'event_type_not_used_for_entitlements',
+  });
+}
+
+async function dodoWebhookHandler(req: Request, res: Response): Promise<void> {
+  if (!billingConfig || demoMode || bootProblem) {
+    res.status(503).json({ error: 'Billing webhook is not configured.', code: 'BILLING_NOT_CONFIGURED' });
+    return;
+  }
+  if (!Buffer.isBuffer(req.body)) {
+    res.status(400).json({ error: 'Webhook body must be raw JSON.' });
+    return;
+  }
+
+  const webhookId = req.header('webhook-id') ?? '';
+  const webhookSignature = req.header('webhook-signature') ?? '';
+  const webhookTimestamp = req.header('webhook-timestamp') ?? '';
+  if (!webhookId || webhookId.length > 255 || !webhookSignature || !webhookTimestamp) {
+    res.status(400).json({ error: 'Missing required webhook headers.' });
+    return;
+  }
+
+  const rawBody = req.body.toString('utf8');
+  let event: any;
+  try {
+    event = dodo().webhooks.unwrap(rawBody, {
+      headers: {
+        'webhook-id': webhookId,
+        'webhook-signature': webhookSignature,
+        'webhook-timestamp': webhookTimestamp,
+      },
+    });
+  } catch (error) {
+    logger.warn({ webhookId, errName: error instanceof Error ? error.name : 'unknown' }, 'invalid Dodo webhook signature');
+    res.status(401).json({ error: 'Invalid webhook signature.' });
+    return;
+  }
+
+  const eventTimestamp = validEventTimestamp(event?.timestamp);
+  const eventType = typeof event?.type === 'string' ? event.type : '';
+  if (!eventTimestamp || !eventType) {
+    logger.warn({ webhookId }, 'verified Dodo webhook had an invalid envelope');
+    res.status(400).json({ error: 'Invalid webhook envelope.' });
+    return;
+  }
+
+  const context: VerifiedWebhookContext = {
+    webhookId,
+    eventType,
+    eventTimestamp,
+    payloadHash: crypto.createHash('sha256').update(req.body).digest('hex'),
+  };
+
+  try {
+    const result = await handleVerifiedDodoWebhook(event, context);
+    logger.info({ webhookId, eventType, result }, 'Dodo webhook persisted');
+    res.status(200).json({ received: true, duplicate: result === 'duplicate' });
+  } catch (error) {
+    // Non-2xx intentionally asks Dodo to retry after a transient provider or
+    // database failure. The SQL transaction rolls back its idempotency claim.
+    logger.error(
+      {
+        webhookId,
+        eventType,
+        upstreamStatus: providerErrorStatus(error),
+        errName: error instanceof Error ? error.name : 'unknown',
+      },
+      'Dodo webhook persistence failed',
+    );
+    res.status(503).json({ error: 'Webhook persistence failed.' });
+  }
+}
 
 // ============================================================================
 // EXPRESS APP SETUP
@@ -1125,6 +1461,16 @@ app.use(
 );
 
 app.use(compression());
+
+// Signature verification must receive the exact bytes Dodo signed. This route
+// is intentionally mounted before the global JSON parser and uses the official
+// SDK's Standard Webhooks verifier.
+app.post(
+  '/api/webhooks/dodo',
+  express.raw({ type: 'application/json', limit: '1mb' }),
+  (req, res, next) => void dodoWebhookHandler(req, res).catch(next),
+);
+
 app.use(express.json({ limit: '20mb' }));
 
 // Rate limiting (in-memory; swap the store for Redis when running multiple
@@ -1151,6 +1497,16 @@ const adminLimiter = rateLimit({
   standardHeaders: 'draft-7',
   legacyHeaders: false,
   message: { error: 'Too many admin requests. Wait a moment and try again.' },
+});
+
+// First layer is per-instance/IP; begin_dodo_checkout adds a durable per-user
+// limit and duplicate lock that remains effective across Vercel instances.
+const billingActionLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  limit: 10,
+  standardHeaders: 'draft-7',
+  legacyHeaders: false,
+  message: { error: 'Too many billing requests. Wait a moment and try again.' },
 });
 
 app.use('/api', apiLimiter);
@@ -1261,6 +1617,11 @@ app.get('/api/health', (_req, res) => {
     status: bootProblem ? 'degraded' : 'ok',
     uptime: process.uptime(),
     mode: demoMode ? 'demo' : 'production',
+    billing: {
+      provider: 'dodo',
+      environment: 'test_mode',
+      configured: Boolean(billingConfig),
+    },
     ...(bootProblem ? { problem: bootProblem } : {}),
   });
 });
@@ -1590,14 +1951,290 @@ app.delete(
   }),
 );
 
-app.get(
-  '/api/account/entitlements',
+async function sendBillingStatus(req: Request, res: Response): Promise<void> {
+  const userId = await requireAuth(req, res);
+  if (!userId) return;
+  const entitlement = await getUserEntitlement(userId);
+  const usedToday = await store.coach.usageToday(userId);
+  res.setHeader('Cache-Control', 'private, no-store');
+  res.json({
+    ...entitlement,
+    usedToday,
+    remainingToday: Math.max(0, entitlement.dailyLimit - usedToday),
+    billingConfigured: Boolean(billingConfig),
+    environment: 'test_mode',
+    price: { currency: 'USD', amount: 900, interval: 'month' },
+  });
+}
+
+app.get('/api/account/entitlements', ah(sendBillingStatus));
+app.get('/api/billing/subscription', ah(sendBillingStatus));
+
+let validatedProductUntil = 0;
+async function validateConfiguredDodoProduct(): Promise<void> {
+  if (!billingConfig) throw new ApiError(503, 'Billing is not configured.', 'BILLING_NOT_CONFIGURED');
+  if (validatedProductUntil > Date.now()) return;
+  const product = await dodo().products.retrieve(billingConfig.productId);
+  const problem = validateProProduct(product as any, billingConfig.productId);
+  if (problem) {
+    logger.error({ productId: billingConfig.productId, problem }, 'Dodo Pro product validation failed');
+    throw new ApiError(503, problem, 'BILLING_PRODUCT_INVALID');
+  }
+  validatedProductUntil = Date.now() + 5 * 60 * 1000;
+}
+
+function providerErrorStatus(error: unknown): number | null {
+  if (!error || typeof error !== 'object') return null;
+  const status = (error as { status?: unknown }).status;
+  return typeof status === 'number' ? status : null;
+}
+
+async function updateCheckoutAttempt(
+  attemptId: string,
+  userId: string,
+  patch: Record<string, unknown>,
+): Promise<void> {
+  const { error } = await sb()
+    .from('billing_checkout_attempts')
+    .update({ ...patch, updated_at: new Date().toISOString() })
+    .eq('id', attemptId)
+    .eq('user_id', userId);
+  if (error) logger.error({ err: error, attemptId, userId }, 'failed to update checkout attempt');
+}
+
+app.post(
+  '/api/billing/checkout',
+  billingActionLimiter,
   ah(async (req, res) => {
-    const userId = await requireAuth(req, res);
+    const userId = await requireAuth(req, res, true);
     if (!userId) return;
-    const plan = await store.coach.getPlan(userId);
-    res.setHeader('Cache-Control', 'private, no-store');
-    res.json({ plan, isPro: plan === 'pro' });
+    if (!billingConfig || demoMode) {
+      throw new ApiError(503, 'Billing is not configured.', 'BILLING_NOT_CONFIGURED');
+    }
+
+    // The request intentionally accepts no product, price, customer, or user
+    // fields. Every security-sensitive value comes from server configuration or
+    // the verified Supabase identity.
+    if (req.body && (typeof req.body !== 'object' || Object.keys(req.body).length > 0)) {
+      throw badRequest('This endpoint does not accept checkout parameters.');
+    }
+
+    const { data: claimRows, error: claimError } = await sb().rpc('begin_dodo_checkout', {
+      p_user_id: userId,
+      p_product_id: billingConfig.productId,
+    });
+    if (claimError) {
+      logger.error({ err: claimError, userId }, 'checkout reservation failed');
+      throw new ApiError(503, 'Billing database is not ready.', 'BILLING_DATABASE_NOT_READY');
+    }
+    const claim = Array.isArray(claimRows) ? claimRows[0] : claimRows;
+    if (claim?.outcome === 'checkout_pending' && claim.attempt_id) {
+      const { data: pendingAttempt, error: pendingError } = await sb()
+        .from('billing_checkout_attempts')
+        .select('checkout_url, checkout_session_id, provider_product_id')
+        .eq('id', claim.attempt_id)
+        .eq('user_id', userId)
+        .maybeSingle();
+      if (pendingError) {
+        throw new ApiError(503, 'Billing database is not ready.', 'BILLING_DATABASE_NOT_READY');
+      }
+      if (
+        pendingAttempt?.provider_product_id === billingConfig.productId &&
+        typeof pendingAttempt.checkout_session_id === 'string' &&
+        isSafeTestCheckoutUrl(pendingAttempt.checkout_url)
+      ) {
+        res.setHeader('Cache-Control', 'private, no-store');
+        return res.status(200).json({ checkoutUrl: pendingAttempt.checkout_url });
+      }
+    }
+    if (!claim || claim.outcome !== 'created' || !claim.attempt_id) {
+      if (claim?.outcome === 'active_subscription') {
+        throw new ApiError(409, 'This account already has Pro access.', 'SUBSCRIPTION_ALREADY_ACTIVE');
+      }
+      if (claim?.outcome === 'checkout_pending') {
+        throw new ApiError(409, 'A checkout is already in progress. Finish or cancel it before retrying.', 'CHECKOUT_PENDING');
+      }
+      if (claim?.outcome === 'rate_limited') {
+        throw new ApiError(429, 'Too many checkout attempts. Try again in 15 minutes.', 'CHECKOUT_RATE_LIMIT');
+      }
+      throw new ApiError(503, 'Unable to reserve a checkout.', 'CHECKOUT_RESERVATION_FAILED');
+    }
+
+    const attemptId = String(claim.attempt_id);
+    let checkoutCreationStarted = false;
+    let checkoutSessionCreated = false;
+    try {
+      await validateConfiguredDodoProduct();
+
+      const [{ data: authResult, error: authError }, { data: existingBilling, error: billingError }] =
+        await Promise.all([
+          sb().auth.admin.getUserById(userId),
+          sb()
+            .from('subscriptions')
+            .select('provider_customer_id')
+            .eq('user_id', userId)
+            .eq('provider', 'dodo')
+            .maybeSingle(),
+        ]);
+      if (
+        authError ||
+        !authResult?.user?.email ||
+        !authResult.user.email_confirmed_at
+      ) {
+        throw new ApiError(400, 'A verified account email is required for checkout.', 'CHECKOUT_EMAIL_REQUIRED');
+      }
+      if (billingError) throw billingError;
+
+      const email = authResult.user.email;
+      // Supabase user_metadata is browser-writable, so it is not used for the
+      // provider customer. Derive the optional display name from the confirmed
+      // Auth email that was fetched server-side.
+      const customerName = String(email.split('@')[0] || 'datings.lol member').slice(0, 100);
+      const providerCustomerId = existingBilling?.provider_customer_id;
+
+      checkoutCreationStarted = true;
+      const session = await dodo().checkoutSessions.create({
+        product_cart: [{ product_id: billingConfig.productId, quantity: 1 }],
+        customer:
+          typeof providerCustomerId === 'string' && providerCustomerId.startsWith('cus_')
+            ? { customer_id: providerCustomerId }
+            : { email, name: customerName },
+        metadata: {
+          app_user_id: userId,
+          checkout_attempt_id: attemptId,
+          app_plan: 'pro_monthly',
+        },
+        return_url: billingReturnUrl(billingConfig),
+        cancel_url: billingCancelUrl(billingConfig),
+        feature_flags: {
+          always_create_new_customer: false,
+          allow_customer_editing_email: false,
+          allow_currency_selection: false,
+          allow_discount_code: false,
+          allow_editing_addons: false,
+          redirect_immediately: true,
+        },
+      }, {
+        // Stable across the SDK's retries and tied to the durable database claim.
+        idempotencyKey: `datings-lol-checkout-${attemptId}`,
+      });
+      checkoutSessionCreated = true;
+
+      if (!isSafeTestCheckoutUrl(session.checkout_url)) {
+        await updateCheckoutAttempt(attemptId, userId, {
+          status: 'pending',
+          checkout_session_id: session.session_id,
+          error_code: 'INVALID_CHECKOUT_URL',
+        });
+        throw new ApiError(502, 'The payment provider returned an invalid test checkout URL.', 'INVALID_CHECKOUT_URL');
+      }
+
+      await updateCheckoutAttempt(attemptId, userId, {
+        status: 'pending',
+        checkout_session_id: session.session_id,
+        checkout_url: session.checkout_url,
+        error_code: null,
+      });
+      res.setHeader('Cache-Control', 'private, no-store');
+      res.status(201).json({ checkoutUrl: session.checkout_url });
+    } catch (error) {
+      const upstreamStatus = providerErrorStatus(error);
+      // Only failures during/after checkout creation are ambiguous. Preflight,
+      // account, and product-validation errors definitely created no session and
+      // must release the claim. A timeout/5xx after sending the create request may
+      // have succeeded upstream, so keep that reservation open until it expires.
+      const ambiguousProviderFailure =
+        checkoutSessionCreated ||
+        (checkoutCreationStarted && (upstreamStatus === null || upstreamStatus >= 500));
+      const outcome = ambiguousProviderFailure ? 'pending' : 'failed';
+      await updateCheckoutAttempt(attemptId, userId, {
+        status: outcome,
+        error_code: error instanceof ApiError ? error.code ?? 'checkout_error' : 'provider_error',
+      });
+      if (error instanceof ApiError) throw error;
+      logger.warn(
+        { upstreamStatus, errName: error instanceof Error ? error.name : 'unknown', userId },
+        'Dodo checkout creation failed',
+      );
+      if (upstreamStatus === 401 || upstreamStatus === 403 || upstreamStatus === 404 || upstreamStatus === 422) {
+        throw new ApiError(503, 'The test billing product or API key is not configured correctly.', 'BILLING_PROVIDER_CONFIGURATION');
+      }
+      if (upstreamStatus === 429) {
+        throw new ApiError(503, 'The payment provider is busy. Try again shortly.', 'BILLING_PROVIDER_RATE_LIMIT');
+      }
+      throw new ApiError(502, 'Could not create a checkout. Please try again later.', 'CHECKOUT_PROVIDER_ERROR');
+    }
+  }),
+);
+
+app.post(
+  '/api/billing/checkout/cancel',
+  billingActionLimiter,
+  ah(async (req, res) => {
+    const userId = await requireAuth(req, res, true);
+    if (!userId) return;
+    let reservationExpiresAt: string | null = null;
+    if (!demoMode) {
+      const { data, error } = await sb()
+        .from('billing_checkout_attempts')
+        .select('expires_at')
+        .eq('user_id', userId)
+        .in('status', ['creating', 'pending'])
+        .order('created_at', { ascending: false })
+        .limit(1)
+        .maybeSingle();
+      if (error) throw new ApiError(503, 'Could not inspect the checkout attempt.');
+      reservationExpiresAt = data?.expires_at ?? null;
+    }
+    // Dodo exposes no checkout-session invalidation endpoint. Retain the durable
+    // reservation (and reuse its URL) rather than creating a second payable
+    // session after a browser-side cancellation.
+    res.json({ acknowledged: true, reservationExpiresAt });
+  }),
+);
+
+app.post(
+  '/api/billing/portal',
+  billingActionLimiter,
+  ah(async (req, res) => {
+    const userId = await requireAuth(req, res, true);
+    if (!userId) return;
+    if (!billingConfig || demoMode) {
+      throw new ApiError(503, 'Billing is not configured.', 'BILLING_NOT_CONFIGURED');
+    }
+    if (req.body && (typeof req.body !== 'object' || Object.keys(req.body).length > 0)) {
+      throw badRequest('This endpoint does not accept customer parameters.');
+    }
+
+    const { data, error } = await sb()
+      .from('subscriptions')
+      .select('provider_customer_id')
+      .eq('user_id', userId)
+      .eq('provider', 'dodo')
+      .maybeSingle();
+    if (error) throw new ApiError(503, 'Billing database is unavailable.');
+    const customerId = data?.provider_customer_id;
+    if (typeof customerId !== 'string' || !customerId.startsWith('cus_')) {
+      throw new ApiError(409, 'No Dodo billing account exists for this user.', 'BILLING_CUSTOMER_NOT_FOUND');
+    }
+
+    try {
+      const portal = await dodo().customers.customerPortal.create(customerId, {
+        return_url: billingPortalReturnUrl(billingConfig),
+      });
+      if (!isSafeDodoPortalUrl(portal.link)) {
+        throw new ApiError(502, 'The payment provider returned an invalid portal URL.', 'INVALID_PORTAL_URL');
+      }
+      res.setHeader('Cache-Control', 'private, no-store');
+      res.json({ portalUrl: portal.link });
+    } catch (error) {
+      if (error instanceof ApiError) throw error;
+      logger.warn(
+        { upstreamStatus: providerErrorStatus(error), errName: error instanceof Error ? error.name : 'unknown', userId },
+        'Dodo customer portal creation failed',
+      );
+      throw new ApiError(502, 'Could not open billing management. Please try again later.', 'PORTAL_PROVIDER_ERROR');
+    }
   }),
 );
 
@@ -1922,6 +2559,16 @@ app.patch(
     const body = parseBody(adminPlanSchema, req.body);
 
     if (!demoMode) {
+      const { data: existing, error: existingError } = await sb()
+        .from('subscriptions')
+        .select('provider')
+        .eq('user_id', userId.data)
+        .maybeSingle();
+      if (existingError) throw new ApiError(500, 'Failed to inspect the user plan.');
+      if (existing?.provider === 'dodo') {
+        throw new ApiError(409, 'Dodo subscriptions must be changed through billing management and verified webhooks.');
+      }
+
       const isPro = body.plan === 'pro';
       const [{ error }, { error: stateError }] = await Promise.all([
         sb().from('subscriptions').upsert(
@@ -1930,6 +2577,15 @@ app.patch(
             plan: body.plan,
             status: isPro ? 'active' : 'inactive',
             provider: 'admin',
+            provider_customer_id: null,
+            provider_subscription_id: null,
+            provider_product_id: null,
+            current_period_start: null,
+            current_period_end: null,
+            past_due_ends_at: null,
+            cancel_at_period_end: false,
+            provider_event_at: null,
+            last_webhook_id: null,
             updated_at: new Date().toISOString(),
           },
           { onConflict: 'user_id' },
@@ -2247,22 +2903,23 @@ app.post(
         return res.status(400).json({ error: 'Message or image is required.' });
       }
 
-      // Quota: atomic consume for free users; pro users skip the check.
-      const plan = await store.coach.getPlan(userId);
-      if (plan === 'free') {
-        const allowed = await store.coach.consumeQuota(userId, env.COACH_FREE_DAILY_LIMIT);
-        if (!allowed) {
-          const used = await store.coach.usageToday(userId);
-          return res.status(429).json({
-            error: 'Daily Coach limit reached.',
-            code: 'COACH_DAILY_LIMIT',
-            plan: 'free',
-            limit: env.COACH_FREE_DAILY_LIMIT,
-            used,
-            remaining: 0,
-          });
-        }
+      // Both plans have a server-configured ceiling. The database increment is
+      // atomic, so concurrent requests cannot all pass a check-then-write race.
+      const entitlement = await getUserEntitlement(userId);
+      const plan = entitlement.plan;
+      const allowed = await store.coach.consumeQuota(userId, entitlement.dailyLimit);
+      if (!allowed) {
+        const used = await store.coach.usageToday(userId);
+        return res.status(429).json({
+          error: 'Daily Coach limit reached.',
+          code: 'COACH_DAILY_LIMIT',
+          plan,
+          limit: entitlement.dailyLimit,
+          used,
+          remaining: 0,
+        });
       }
+      const usedToday = await store.coach.usageToday(userId);
 
       const vibeInstruction =
         body.vibe === 'brutal' || body.vibe === 'roasty'
@@ -2336,6 +2993,11 @@ STRICT RULES:
             outputTokens: result.outputTokens,
             totalTokens: result.totalTokens,
           },
+          quota: {
+            limit: entitlement.dailyLimit,
+            used: usedToday,
+            remaining: Math.max(0, entitlement.dailyLimit - usedToday),
+          },
         });
       }
 
@@ -2346,6 +3008,11 @@ STRICT RULES:
         isAi: false,
         plan,
         usage: { model: null, inputTokens: null, outputTokens: null, totalTokens: null },
+        quota: {
+          limit: entitlement.dailyLimit,
+          used: usedToday,
+          remaining: Math.max(0, entitlement.dailyLimit - usedToday),
+        },
       });
     } catch (error) {
       if (error instanceof ApiError) throw error;

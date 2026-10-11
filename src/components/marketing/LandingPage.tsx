@@ -106,7 +106,7 @@ const TESTIMONIALS = [
 
 const STATS = [
   { value: "0.8s", label: "How long your first photo gets before the swipe" },
-  { value: "3/day", label: "Free coach roasts. Pro goes unlimited." },
+  { value: "3/day", label: "Free AI Coach chats. Pro raises the daily limit." },
   { value: "2 min", label: "Length of a daily lesson. That's the whole ask." },
   { value: "24hrs", label: "The double-text rule that saves your dignity" },
 ];

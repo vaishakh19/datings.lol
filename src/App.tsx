@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useRef } from "react";
+import React, { useCallback, useState, useEffect, useRef } from "react";
 import {
   UserProfile,
   UserProgress,
@@ -50,7 +50,14 @@ import {
   saveAdminSettings,
 } from "./utils/adminStorage";
 import { loadPublicAdminSettings, verifyAdminSession } from "./lib/adminApi";
-import { loadAccountEntitlements } from "./lib/api";
+import {
+  BillingStatus,
+  closeCancelledCheckout,
+  createBillingCheckout,
+  createBillingPortal,
+  loadAccountEntitlements,
+  loadBillingStatus,
+} from "./lib/api";
 
 const MAX_FREE_CHATS = 3;
 
@@ -112,6 +119,12 @@ export default function App() {
   const [avatarUrl, setAvatarUrl] = useState<string | null>(null);
   const [screenshots, setScreenshots] = useState<string[]>([]);
   const [isPro, setIsPro] = useState(false);
+  const [billingStatus, setBillingStatus] = useState<BillingStatus | null>(null);
+  const [billingNotice, setBillingNotice] = useState<
+    "idle" | "loading" | "pending" | "failed" | "activated" | "cancelled"
+  >("idle");
+  const [billingActionError, setBillingActionError] = useState("");
+  const billingReturnHandledRef = useRef(false);
   const [chatsUsedToday, setChatsUsedToday] = useState(0);
   const [lastChatDate, setLastChatDate] = useState<string>("");
   const [lastHotTakeDate, setLastHotTakeDate] = useState("");
@@ -230,7 +243,8 @@ export default function App() {
     setMessages(nextState.messages);
     setAvatarUrl(nextState.avatarUrl);
     setScreenshots(nextState.screenshots);
-    setIsPro(nextState.isPro);
+    // Never hydrate paid access from user_app_state; it is browser-writable.
+    setIsPro(false);
     setChatsUsedToday(nextState.chatsUsedToday);
     setLastChatDate(nextState.lastChatDate);
     setLastHotTakeDate(nextState.lastHotTakeDate);
@@ -262,6 +276,11 @@ export default function App() {
     if (!userId) {
       hydratedUserIdRef.current = null;
       entitlementsLoadedForRef.current = null;
+      billingReturnHandledRef.current = false;
+      setBillingStatus(null);
+      setBillingNotice("idle");
+      setBillingActionError("");
+      setIsPro(false);
       setSyncStatus("loading");
       return;
     }
@@ -312,9 +331,21 @@ export default function App() {
     };
   }, [supabaseUser?.id]);
 
+  const applyAuthoritativeBilling = useCallback((status: BillingStatus) => {
+    setBillingStatus(status);
+    setIsPro(status.isPro);
+    setChatsUsedToday(status.usedToday);
+    setLastChatDate(getTodayStr());
+  }, []);
+
+  const refreshBilling = useCallback(async (): Promise<BillingStatus> => {
+    const status = await loadBillingStatus();
+    applyAuthoritativeBilling(status);
+    return status;
+  }, [applyAuthoritativeBilling]);
+
   // Paid access is an account entitlement, not a client preference. Reconcile
-  // the synchronized UI payload with the authoritative subscriptions table
-  // after hydration so admin plan changes take effect on every device.
+  // only through the authenticated server endpoint after state hydration.
   useEffect(() => {
     const userId = supabaseUser?.id;
     if (
@@ -329,13 +360,69 @@ export default function App() {
     void loadAccountEntitlements()
       .then((entitlements) => {
         if (entitlements && hydratedUserIdRef.current === userId) {
-          setIsPro(entitlements.isPro);
+          applyAuthoritativeBilling(entitlements);
+        } else {
+          entitlementsLoadedForRef.current = null;
         }
       })
       .catch(() => {
         entitlementsLoadedForRef.current = null;
       });
-  }, [supabaseUser?.id, syncStatus]);
+  }, [applyAuthoritativeBilling, supabaseUser?.id, syncStatus]);
+
+  // Dodo's redirect is only a UI hint. On return, show a pending state and poll
+  // the verified database entitlement; never unlock from query parameters.
+  useEffect(() => {
+    const userId = supabaseUser?.id;
+    if (
+      !userId ||
+      syncStatus === "loading" ||
+      hydratedUserIdRef.current !== userId ||
+      billingReturnHandledRef.current
+    ) {
+      return;
+    }
+
+    const params = new URLSearchParams(window.location.search);
+    const flow = params.get("billing");
+    if (flow !== "return" && flow !== "cancelled") return;
+    billingReturnHandledRef.current = true;
+    window.history.replaceState({}, "", "/profile");
+    setActiveTab("profile");
+    setBillingActionError("");
+
+    if (flow === "cancelled") {
+      setBillingNotice("cancelled");
+      void closeCancelledCheckout().catch(() => undefined);
+      return;
+    }
+
+    if (params.get("status") === "failed") {
+      setBillingNotice("failed");
+      return;
+    }
+
+    let cancelled = false;
+    setBillingNotice("pending");
+    const confirm = async () => {
+      for (let attempt = 0; attempt < 10 && !cancelled; attempt += 1) {
+        try {
+          const status = await refreshBilling();
+          if (status.isPro) {
+            if (!cancelled) setBillingNotice("activated");
+            return;
+          }
+        } catch {
+          // Webhook/database propagation may still be in flight; retry below.
+        }
+        await new Promise((resolve) => window.setTimeout(resolve, 2500));
+      }
+    };
+    void confirm();
+    return () => {
+      cancelled = true;
+    };
+  }, [refreshBilling, supabaseUser?.id, syncStatus]);
 
   // Keep a fast per-user cache and debounce writes into one ordered Supabase
   // upsert. Ordering prevents an older request from overwriting a newer state.
@@ -730,7 +817,8 @@ export default function App() {
     const userText = text || "";
     if (!userText && !imageBase64) return;
 
-    if (!isPro && chatsUsedToday >= MAX_FREE_CHATS) {
+    const freeDailyLimit = billingStatus?.freeDailyLimit ?? MAX_FREE_CHATS;
+    if (!isPro && chatsUsedToday >= freeDailyLimit) {
       setShowProModal(true);
       return;
     }
@@ -777,13 +865,34 @@ export default function App() {
       const data = await res.json();
       setIsTyping(false);
 
+      if (!res.ok) {
+        if (res.status === 429 && data.code === "COACH_DAILY_LIMIT") {
+          if (typeof data.used === "number") setChatsUsedToday(data.used);
+          if (data.plan === "free") setShowProModal(true);
+          setMessages((prev) => [
+            ...prev,
+            {
+              id: (Date.now() + 1).toString(),
+              role: "coach",
+              text: `Daily Coach limit reached (${data.used ?? data.limit}/${data.limit}). Your allowance resets at 00:00 UTC.`,
+              time: "now",
+            },
+          ]);
+          return;
+        }
+        throw new Error(typeof data.error === "string" ? data.error : "Coach request failed");
+      }
+
+      if (data.plan === "free" || data.plan === "pro") setIsPro(data.plan === "pro");
+      if (typeof data.quota?.used === "number") setChatsUsedToday(data.quota.used);
+
       const botMessage: ChatMessage = {
         id: (Date.now() + 1).toString(),
         role: "coach",
         text: data.text || "COACH'S TAKE\nSomething went sideways. Try sending that again.",
         time: "now",
         isAi: data.isAi,
-        options: getFollowUpOptions(userText, data.text),
+        options: getFollowUpOptions(userText, data.text || ""),
       };
 
       setMessages((prev) => [...prev, botMessage]);
@@ -792,9 +901,8 @@ export default function App() {
       const botMessage: ChatMessage = {
         id: (Date.now() + 1).toString(),
         role: "coach",
-        text: "match their energy, add ONE playful tease, and end with a concrete question or plan. no paragraphs!",
+        text: "Coach is temporarily unavailable. Your server-side daily allowance may already include this attempt; refresh your billing status before retrying.",
         time: "now",
-        options: ["Give me an opener", "What do I text back?", "Roast my chat"],
       };
       setMessages((prev) => [...prev, botMessage]);
     }
@@ -815,6 +923,8 @@ export default function App() {
     const reset = createDefaultUserAppState();
     reset.lastChatDate = getTodayStr();
     applyUserState(reset);
+    setIsPro(Boolean(billingStatus?.isPro));
+    setChatsUsedToday(billingStatus?.usedToday ?? 0);
     setActiveTab("today");
     setIsDayCompleted(false);
     setShowProModal(false);
@@ -842,19 +952,29 @@ export default function App() {
     ]);
   };
 
-  const handleUpgradeToPro = () => {
-    setIsPro(true);
-    setShowProModal(false);
+  const handleUpgradeToPro = async () => {
+    setBillingNotice("loading");
+    setBillingActionError("");
+    try {
+      const checkout = await createBillingCheckout();
+      // The API validates this as a Dodo test checkout URL before returning it.
+      window.location.assign(checkout.checkoutUrl);
+    } catch (error) {
+      setBillingNotice("failed");
+      setBillingActionError(error instanceof Error ? error.message : "Could not start checkout.");
+    }
+  };
 
-    const proMessage: ChatMessage = {
-      id: (Date.now() + 1).toString(),
-      role: "coach",
-      text: "LETS GOOO 🚀 welcome to Pro! You now have unlimited coaching 24/7. Roast My Chat, Profile Review, all lessons unlocked. What are we fixing first?",
-      time: "now",
-      options: ["Roast my chat", "Profile review", "What do I text back?"],
-    };
-
-    setMessages((prev) => [...prev, proMessage]);
+  const handleManageBilling = async () => {
+    setBillingNotice("loading");
+    setBillingActionError("");
+    try {
+      const portal = await createBillingPortal();
+      window.location.assign(portal.portalUrl);
+    } catch (error) {
+      setBillingNotice("failed");
+      setBillingActionError(error instanceof Error ? error.message : "Could not open billing management.");
+    }
   };
 
   if (authLoading) {
@@ -938,6 +1058,9 @@ export default function App() {
         <ProModal
           onClose={() => setShowProModal(false)}
           onUpgrade={handleUpgradeToPro}
+          proDailyLimit={billingStatus?.proDailyLimit ?? 100}
+          billingConfigured={billingStatus?.billingConfigured ?? false}
+          error={billingActionError}
         />
       )}
 
@@ -1057,7 +1180,8 @@ export default function App() {
             onSendMessage={handleSendMessage}
             isPro={isPro}
             chatsUsedToday={chatsUsedToday}
-            maxFreeChats={MAX_FREE_CHATS}
+            maxFreeChats={billingStatus?.freeDailyLimit ?? MAX_FREE_CHATS}
+            maxDailyChats={billingStatus?.dailyLimit ?? MAX_FREE_CHATS}
             onOpenProModal={() => setShowProModal(true)}
             onNewSession={handleNewCoachSession}
             onMessageFeedback={handleCoachMessageFeedback}
@@ -1100,11 +1224,12 @@ export default function App() {
             onUpdateProfile={handleUpdateProfile}
             onAwardXp={handleCommunityXp}
             chatsUsedToday={chatsUsedToday}
-            maxFreeChats={MAX_FREE_CHATS}
-            onDowngradeToFree={() => {
-              setIsPro(false);
-              setChatsUsedToday(0);
-            }}
+            maxFreeChats={billingStatus?.freeDailyLimit ?? MAX_FREE_CHATS}
+            billingStatus={billingStatus}
+            billingNotice={billingNotice}
+            billingError={billingActionError}
+            onManageBilling={handleManageBilling}
+            onRefreshBilling={refreshBilling}
             currentUser={currentUser}
             onSignOut={handleSignOut}
             onOpenAuth={handleOpenAuth}

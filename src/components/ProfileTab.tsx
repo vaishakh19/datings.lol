@@ -4,13 +4,17 @@ import {
   Award,
   Camera,
   Check,
+  CreditCard,
+  Crown,
   Download,
   Flame,
   Heart,
   Image as ImageIcon,
   KeyRound,
+  LoaderCircle,
   LogOut,
   Pencil,
+  RefreshCw,
   ShieldCheck,
   Sparkles,
   Star,
@@ -35,6 +39,7 @@ import {
 import { BADGES } from "../data/badges";
 import { getRankInfo } from "../data/lessons";
 import { processUploadFile } from "../utils/imageCompressor";
+import type { BillingStatus } from "../lib/api";
 
 interface ProfileTabProps {
   profile: UserProfile;
@@ -53,7 +58,11 @@ interface ProfileTabProps {
   onAwardXp?: (amount: number, reason: string) => void;
   chatsUsedToday: number;
   maxFreeChats: number;
-  onDowngradeToFree: () => void;
+  billingStatus?: BillingStatus | null;
+  billingNotice?: "idle" | "loading" | "pending" | "failed" | "activated" | "cancelled";
+  billingError?: string;
+  onManageBilling?: () => void | Promise<void>;
+  onRefreshBilling?: () => void | Promise<unknown>;
   currentUser?: AuthUser | null;
   onSignOut?: () => void | Promise<void>;
   onOpenAuth?: (view?: AuthView) => void;
@@ -117,6 +126,14 @@ function titleCase(value: string) {
   return value.replace(/\b\w/g, (letter) => letter.toUpperCase());
 }
 
+function formatBillingDate(value?: string | null) {
+  if (!value) return "Not available";
+  const date = new Date(value);
+  return Number.isFinite(date.getTime())
+    ? date.toLocaleDateString(undefined, { year: "numeric", month: "short", day: "numeric" })
+    : "Not available";
+}
+
 export const ProfileTab: React.FC<ProfileTabProps> = ({
   profile,
   progress,
@@ -134,7 +151,11 @@ export const ProfileTab: React.FC<ProfileTabProps> = ({
   onAwardXp,
   chatsUsedToday,
   maxFreeChats,
-  onDowngradeToFree,
+  billingStatus,
+  billingNotice = "idle",
+  billingError,
+  onManageBilling,
+  onRefreshBilling,
   currentUser,
   onSignOut,
   onOpenAuth,
@@ -1360,6 +1381,121 @@ export const ProfileTab: React.FC<ProfileTabProps> = ({
 
         </div>
 
+      </section>
+
+
+      {/* =========================================================
+          BILLING
+      ========================================================= */}
+
+      <section className="bg-[#FFE066] border-[3px] border-black rounded-[25px] p-5 brutal-shadow">
+        <div className="flex items-start justify-between gap-3">
+          <div>
+            <div className="text-[9px] font-black uppercase tracking-widest opacity-55">
+              Billing • Test mode
+            </div>
+            <h2 className="font-black text-[21px] tracking-tighter flex items-center gap-2">
+              <CreditCard size={18} />
+              Your plan
+            </h2>
+          </div>
+          <span className={`border-[2px] border-black rounded-full px-3 py-1 text-[9px] font-black uppercase ${isPro ? "bg-black text-[#FFE066]" : "bg-white"}`}>
+            {isPro ? "Pro" : "Free"}
+          </span>
+        </div>
+
+        <div className="mt-4 bg-white border-[2px] border-black rounded-[16px] p-3 text-[10px] space-y-2">
+          <div className="flex justify-between gap-3">
+            <b>Current plan</b>
+            <span className="font-black">{isPro ? "Pro • $9/month" : "Free • $0"}</span>
+          </div>
+          <div className="flex justify-between gap-3">
+            <b>AI Coach</b>
+            <span className="text-right">
+              {chatsUsedToday}/{billingStatus?.dailyLimit ?? maxFreeChats} chats today
+            </span>
+          </div>
+          {billingStatus?.provider === "dodo" && (
+            <>
+              <div className="flex justify-between gap-3">
+                <b>Status</b>
+                <span className="font-black capitalize">{billingStatus.status.replaceAll("_", " ")}</span>
+              </div>
+              {billingStatus.renewalDate && (
+                <div className="flex justify-between gap-3">
+                  <b>Renews</b>
+                  <span>{formatBillingDate(billingStatus.renewalDate)}</span>
+                </div>
+              )}
+              {billingStatus.accessEndsAt && (
+                <div className="flex justify-between gap-3">
+                  <b>Access ends</b>
+                  <span>{formatBillingDate(billingStatus.accessEndsAt)}</span>
+                </div>
+              )}
+            </>
+          )}
+        </div>
+
+        {billingStatus?.status === "past_due" && (
+          <p className="mt-3 bg-[#FDA4AF] border-[2px] border-black rounded-[12px] p-2.5 text-[10px] font-bold">
+            Payment is past due. Pro remains available only through the provider grace period shown above.
+          </p>
+        )}
+        {(billingStatus?.status === "on_hold" || billingStatus?.status === "failed" || billingStatus?.status === "revoked") && (
+          <p className="mt-3 bg-[#FDA4AF] border-[2px] border-black rounded-[12px] p-2.5 text-[10px] font-bold">
+            Pro access is paused because billing is not active. Open billing management to review payment details.
+          </p>
+        )}
+
+        {billingNotice !== "idle" && (
+          <div className={`mt-3 border-[2px] border-black rounded-[12px] p-2.5 text-[10px] font-bold ${billingNotice === "activated" ? "bg-[#BEF264]" : billingNotice === "failed" ? "bg-[#FDA4AF]" : "bg-white"}`}>
+            {billingNotice === "loading" && "Opening secure Dodo Payments test billing…"}
+            {billingNotice === "pending" && "Payment returned. Waiting for a verified Dodo webhook before activating Pro."}
+            {billingNotice === "failed" && (billingError || "The billing action failed. No Pro access was granted.")}
+            {billingNotice === "activated" && "Subscription activated. Your verified Pro allowance is ready."}
+            {billingNotice === "cancelled" && "Checkout cancelled. Your current plan was not changed."}
+          </div>
+        )}
+
+        <div className="grid grid-cols-2 gap-2 mt-3">
+          {!isPro && (
+            <button
+              type="button"
+              onClick={onOpenProModal}
+              disabled={!billingStatus?.billingConfigured || billingNotice === "loading"}
+              className="h-10 bg-black text-white border-[2px] border-black rounded-full font-black text-[9px] uppercase disabled:opacity-45"
+            >
+              <Crown size={12} className="inline mr-1" />
+              Upgrade to Pro
+            </button>
+          )}
+          {billingStatus?.canManageBilling && (
+            <button
+              type="button"
+              onClick={() => void onManageBilling?.()}
+              disabled={billingNotice === "loading"}
+              className="h-10 bg-white border-[2px] border-black rounded-full font-black text-[9px] uppercase disabled:opacity-45"
+            >
+              {billingNotice === "loading" ? <LoaderCircle size={12} className="inline mr-1 animate-spin" /> : <CreditCard size={12} className="inline mr-1" />}
+              Manage / cancel
+            </button>
+          )}
+          <button
+            type="button"
+            onClick={() => void onRefreshBilling?.()}
+            className="h-10 bg-white border-[2px] border-black rounded-full font-black text-[9px] uppercase"
+          >
+            <RefreshCw size={12} className="inline mr-1" />
+            Refresh status
+          </button>
+        </div>
+
+        {!billingStatus?.billingConfigured && (
+          <p className="text-[9px] font-bold mt-3 opacity-60">
+            Test checkout is disabled until the server billing variables and migration are configured.
+          </p>
+        )}
       </section>
 
 

@@ -7,27 +7,23 @@ interface PricingPageProps {
 
 const FREE_FEATURES = [
   { text: "Daily brutal lesson + task", included: true },
-  { text: "3 coach roasts per day", included: true },
+  { text: "3 AI Coach chats per day", included: true },
   { text: "Streaks, XP, ranks & badges", included: true },
   { text: "Daily hot take votes", included: true },
-  { text: "Unlimited chat + photo roasts", included: false },
-  { text: "Full profile roast report", included: false },
-  { text: "Streak freeze", included: false },
+  { text: "Higher daily Coach allowance", included: false },
 ];
 
 const PRO_FEATURES = [
-  { text: "Everything in Free", included: true },
-  { text: "Unlimited chat + photo upload roasts", included: true },
-  { text: "Profile roast report (photos, prompts, bio)", included: true },
-  { text: "All lessons unlocked", included: true },
-  { text: "Streak freeze — protect the grind", included: true },
-  { text: "Coach on call 24/7, no daily cap", included: true },
+  { text: "Everything currently available in Free", included: true },
+  { text: "Higher server-enforced daily Coach allowance", included: true },
+  { text: "Chat and photo coaching within that allowance", included: true },
+  { text: "Hosted billing management and cancellation", included: true },
 ];
 
 const FAQS = [
   {
     q: "Is the free plan actually free?",
-    a: "Yes. No card, no trial countdown, no bait. You get a real daily lesson and 3 coach roasts a day, forever. Pro exists for people who want the coach on unlimited call.",
+    a: "Yes. No card and no trial countdown. You get a real daily lesson and 3 AI Coach chats a day. Pro is for people who need a higher daily allowance.",
   },
   {
     q: "What does the coach actually do?",
@@ -55,8 +51,8 @@ export const PricingPage: React.FC<PricingPageProps> = ({ navigate }) => {
           Cheaper than one bad date.
         </h1>
         <p className="mt-3 text-[15px] font-bold text-black/60 max-w-[460px] mx-auto">
-          Start free. Upgrade when you want the coach on unlimited call. That's the
-          whole pricing page, but here it is in card form:
+          Start free. Upgrade when you need a higher daily Coach allowance. That's
+          the whole pricing page, but here it is in card form:
         </p>
       </div>
 
@@ -122,7 +118,7 @@ export const PricingPage: React.FC<PricingPageProps> = ({ navigate }) => {
             <span className="font-bold text-white/50 text-[14px] mb-1.5">/ month</span>
           </div>
           <p className="text-[13px] font-bold text-white/60 mb-6">
-            The coach on unlimited call. No daily cap, no mercy.
+            More daily coaching, with a server-enforced fair-use cap.
           </p>
           <ul className="space-y-2.5 mb-8">
             {PRO_FEATURES.map((f) => (
