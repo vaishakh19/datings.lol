@@ -17,16 +17,33 @@ import { LESSONS } from "./data/lessons";
 import { Onboarding } from "./components/Onboarding";
 import { Header } from "./components/Header";
 import { Navigation } from "./components/Navigation";
-import { TodayTab } from "./components/TodayTab";
-import { CoachTab } from "./components/CoachTab";
-import { ProfileTab } from "./components/ProfileTab";
-import { SupportTab } from "./components/SupportTab";
-import { CommunityTab } from "./components/CommunityTab";
-import { ProModal } from "./components/ProModal";
-import { HotTakeModal } from "./components/HotTakeModal";
 import { AuthContainer } from "./components/auth/AuthContainer";
 import { AuthCallbackPage, ForgotPasswordPage, ResetPasswordPage } from "./components/auth/AuthRoutes";
-import { MarketingSite, isMarketingPath } from "./components/marketing/MarketingSite";
+import { isMarketingPath } from "./utils/routes";
+
+// Tabs, modals and marketing pages are code-split so the initial app shell
+// stays lean. React.lazy + Suspense handles the loading boundary.
+const TodayTab = React.lazy(() =>
+  import("./components/TodayTab").then((m) => ({ default: m.TodayTab })),
+);
+const CoachTab = React.lazy(() =>
+  import("./components/CoachTab").then((m) => ({ default: m.CoachTab })),
+);
+const ProfileTab = React.lazy(() =>
+  import("./components/ProfileTab").then((m) => ({ default: m.ProfileTab })),
+);
+const CommunityTab = React.lazy(() =>
+  import("./components/CommunityTab").then((m) => ({ default: m.CommunityTab })),
+);
+const ProModal = React.lazy(() =>
+  import("./components/ProModal").then((m) => ({ default: m.ProModal })),
+);
+const HotTakeModal = React.lazy(() =>
+  import("./components/HotTakeModal").then((m) => ({ default: m.HotTakeModal })),
+);
+const MarketingSite = React.lazy(() =>
+  import("./components/marketing/MarketingSite").then((m) => ({ default: m.MarketingSite })),
+);
 
 /** Paths that render the auth UI for signed-out visitors. */
 const PUBLIC_AUTH_PATHS = new Set(["/", "/login", "/signup", "/forgot-password"]);
@@ -165,8 +182,7 @@ export default function App() {
       username: supabaseUser.user_metadata?.username || email.split("@")[0] || "member",
       email,
       name: supabaseUser.user_metadata?.display_name || email.split("@")[0] || "Member",
-      passwordHash: "",
-      createdAt: supabaseUser.created_at,
+      createdAt: supabaseUser.created_at || new Date().toISOString(),
       lastLoginAt: new Date().toISOString(),
       profile: profile || undefined,
       progress,
@@ -990,7 +1006,15 @@ export default function App() {
     const isAuthed = !!supabaseUser || isGuest;
     if (!isAuthed || pathname !== "/") {
       return (
-        <MarketingSite pathname={pathname} navigate={navigate} isAuthed={isAuthed} />
+        <React.Suspense
+          fallback={
+            <div className="min-h-screen bg-[#FFFBEB] flex items-center justify-center">
+              <div className="w-10 h-10 rounded-full border-[3px] border-black/15 border-t-black animate-spin" />
+            </div>
+          }
+        >
+          <MarketingSite pathname={pathname} navigate={navigate} isAuthed={isAuthed} />
+        </React.Suspense>
       );
     }
   }
@@ -1054,24 +1078,28 @@ export default function App() {
       )}
 
       {/* Pro Modal */}
-      {showProModal && (
-        <ProModal
-          onClose={() => setShowProModal(false)}
-          onUpgrade={handleUpgradeToPro}
-          proDailyLimit={billingStatus?.proDailyLimit ?? 100}
-          billingConfigured={billingStatus?.billingConfigured ?? false}
-          error={billingActionError}
-        />
-      )}
+      <React.Suspense fallback={null}>
+        {showProModal && (
+          <ProModal
+            onClose={() => setShowProModal(false)}
+            onUpgrade={handleUpgradeToPro}
+            proDailyLimit={billingStatus?.proDailyLimit ?? 100}
+            billingConfigured={billingStatus?.billingConfigured ?? false}
+            error={billingActionError}
+          />
+        )}
+      </React.Suspense>
 
       {/* Daily Hot Take Modal */}
-      {showHotTakeModal && !inAdminWorkspace && (
-        <HotTakeModal
-          hotTake={todayHotTake}
-          onVote={handleVoteHotTake}
-          onClose={handleCloseHotTakeModal}
-        />
-      )}
+      <React.Suspense fallback={null}>
+        {showHotTakeModal && !inAdminWorkspace && (
+          <HotTakeModal
+            hotTake={todayHotTake}
+            onVote={handleVoteHotTake}
+            onClose={handleCloseHotTakeModal}
+          />
+        )}
+      </React.Suspense>
 
       {/* Auth View Modal when triggered from inside the app */}
       {showAuthView && (
@@ -1158,6 +1186,13 @@ export default function App() {
           </div>
         )}
 
+        <React.Suspense
+          fallback={
+            <div className="min-h-[50vh] flex items-center justify-center">
+              <div className="w-8 h-8 rounded-full border-[3px] border-black/15 border-t-black animate-spin" />
+            </div>
+          }
+        >
         {activeTab === "today" && (
           <TodayTab
             currentDay={currentDay}
@@ -1244,6 +1279,7 @@ export default function App() {
             onUpdatePassword={updatePassword}
           />
         )}
+        </React.Suspense>
 
         {activeTab === "admin" && adminAccess === "checking" && (
           <div className="min-h-screen bg-[#F4F5EF] flex flex-col items-center justify-center gap-3">

@@ -1,14 +1,23 @@
 # datings.lol
 
-React/Vite frontend, Express API, Supabase authentication and persistence, Gemini Coach, and Dodo Payments subscriptions.
+React 19 / Vite SPA with an Express API, Supabase auth and persistence, a Gemini dating coach, and Dodo Payments subscriptions (TEST MODE only).
 
-> **Billing safety boundary:** this repository currently supports **Dodo TEST MODE only**. It rejects live API keys, any environment other than `test_mode`, and custom Dodo base URLs. No real payment credentials belong in this setup.
+> **Billing safety boundary:** this repository supports **Dodo TEST MODE only**. It rejects live API keys, any environment other than `test_mode`, and custom Dodo base URLs. No real payment credentials belong in this setup.
+
+## Quick start
+
+```bash
+npm ci
+cp .env.example .env     # set values; ALLOW_DEMO_MODE=true runs fully offline
+npm run dev              # http://127.0.0.1:3000 — Vite middleware + Express API
+npm run verify           # lint + test + build (required before every PR)
+```
 
 ## Architecture
 
-- `src/` is the React/Vite SPA.
-- `server.ts` is the shared Express API used locally and by Vercel.
-- `api/index.ts` is Vercel's serverless adapter; `vercel.json` sends every `/api/*` request to it.
+- `src/` — React/Vite SPA. Tabs, modals, and marketing pages are code-split.
+- `server.ts` — Express API used locally and as a Vercel serverless function.
+- `api/index.ts` — Vercel serverless adapter; `vercel.json` rewrites every `/api/*` here.
 - Supabase Auth supplies browser sessions. The API re-verifies bearer tokens with Supabase; billing mutations require a fresh verification.
 - Supabase service-role access is server-only. RLS lets a signed-in user read only a restricted projection of their own subscription and never write billing state.
 - Dodo Checkout Sessions and the Customer Portal are hosted by Dodo. The browser never supplies a product, price, app user ID, Dodo customer ID, or entitlement.
@@ -176,11 +185,13 @@ Every `/api/coach` request obtains the current server entitlement and atomically
 
 ## Deploying to Vercel
 
-The Vite SPA and Express API must deploy together:
+The Vite SPA and Express API deploy together via `npm run build` (set as `buildCommand` in vercel.json):
 
-- `api/index.ts` imports the same Express app used locally.
-- `vercel.json` routes all `/api/*` paths to that function and SPA routes to `index.html`.
-- `/api/webhooks/dodo` therefore reaches the raw-body route without a second backend.
+- `vite build` produces the SPA in `dist/` (immutable asset caching configured).
+- `esbuild` bundles `server.ts` into `dist/server.cjs` for standalone deploys.
+- Vercel's Node builder also compiles `api/index.ts` (which imports `server.ts`) for the serverless target; both builds use the same TypeScript source.
+- `vercel.json` rewrites `/api/*` to `/api/index.ts` and SPA routes to `/index.html`. Static assets under `/assets/` are served with long-lived immutable cache headers.
+- `/api/webhooks/dodo` is mounted with `express.raw()` before the JSON parser so signature verification sees the exact signed bytes.
 
 Set all server and browser variables in **Vercel → Project → Settings → Environment Variables** before deploying. Use only test Dodo credentials. Apply variables to each Vercel environment that will exercise billing, and ensure that environment's `APP_URL` exactly matches its public origin. Redeploy after changing variables.
 
@@ -198,14 +209,20 @@ Expected billing metadata when configured:
 
 Additional fields may be present. If HTML is returned, `/api/*` is incorrectly reaching the SPA. If `status` is `degraded`, fix the reported server configuration and redeploy. Never print environment variable values while diagnosing.
 
+## Security defaults
+
+- CSP is ON by default in production (scoped to `'self'`, `*.supabase.co` wss+https, Dodo test & prod checkout/portal, Google Fonts). Set `ENABLE_CSP=false` to opt out if you need to debug a CSP breakage.
+- HSTS, `Referrer-Policy: strict-origin-when-cross-origin`, `Cross-Origin-Opener-Policy: same-origin`, and `X-Content-Type-Options: nosniff` are enabled in production.
+- CORS is allowlist-only; `APP_URL` and `VERCEL_URL` (preview) are auto-added; set `CORS_ORIGINS` for any extra origins.
+- Rate limits are in-memory per serverless instance. Sensitive actions (checkout, Coach) additionally use database-backed per-user locks and atomic quotas.
+- Trust proxy defaults to 1 hop (suitable for Vercel). Override with `TRUST_PROXY_HOPS` if you front the app with Cloudflare/nginx.
+
 ## Automated verification
 
 ```bash
 npm ci
-npm run lint
-npm test
-npm run build
-npm audit
+npm run verify    # lint + test + build
+npm audit --omit=dev
 ```
 
 The billing tests cover fail-closed configuration, hosted URL allowlists, exact product validation, finite entitlement policy, Dodo payload normalization/event names, raw-body middleware ordering, browser-input exclusion, durable checkout/idempotency guards, migration privileges, event ordering, quarantine paths, and atomic quota structure.
