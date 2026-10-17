@@ -7,21 +7,9 @@ import { PricingPage } from "./PricingPage";
 import { AboutPage } from "./AboutPage";
 import { LegalPage } from "./LegalPage";
 import { getArticleBySlug } from "../../data/articles";
-import { getLegalDoc, LEGAL_DOCS } from "../../data/legal";
-
-const LEGAL_PATHS = new Set(LEGAL_DOCS.map((doc) => `/${doc.slug}`));
-
-/** All paths served by the public marketing site. */
-export function isMarketingPath(path: string): boolean {
-  return (
-    path === "/" ||
-    path === "/blog" ||
-    path.startsWith("/blog/") ||
-    path === "/pricing" ||
-    path === "/about" ||
-    LEGAL_PATHS.has(path)
-  );
-}
+import { getLegalDoc } from "../../data/legal";
+import { LEGAL_PATHS, isMarketingPath } from "../../utils/routes";
+export { isMarketingPath } from "../../utils/routes";
 
 interface MarketingSiteProps {
   pathname: string;

@@ -79,7 +79,9 @@ const envSchema = z.object({
   APP_URL: z.string().optional(),
 
   ALLOW_DEMO_MODE: z.enum(['true', 'false']).default('false'),
-  ENABLE_CSP: z.enum(['true', 'false']).default('false'),
+  // CSP defaults ON in production. Set ENABLE_CSP=false to opt out (documented
+  // in README and SECURITY.md).
+  ENABLE_CSP: z.enum(['true', 'false']).optional(),
   CORS_ORIGINS: z.string().optional(),
   ADMIN_USER_IDS: z.string().optional(),
   LOG_LEVEL: z.enum(['fatal', 'error', 'warn', 'info', 'debug', 'trace']).default('info'),
@@ -113,6 +115,11 @@ const env = envResult.success ? envResult.data : envSchema.parse({});
 
 const isProd = env.NODE_ENV === 'production';
 const demoMode = env.ALLOW_DEMO_MODE === 'true';
+// Default CSP to ON in production unless explicitly opted out; in non-production
+// builds it defaults OFF so local dev is frictionless. Setting ENABLE_CSP to
+// "true" or "false" overrides either environment.
+const enableCsp =
+  env.ENABLE_CSP === 'true' ? true : env.ENABLE_CSP === 'false' ? false : isProd;
 const SUPABASE_URL = env.SUPABASE_URL ?? env.VITE_SUPABASE_URL ?? null;
 const SUPABASE_SERVICE_ROLE_KEY = env.SUPABASE_SERVICE_ROLE_KEY ?? null;
 const GEMINI_API_KEY =
@@ -744,19 +751,17 @@ function createSupabaseStore(): DataStore {
     return c || 0;
   };
 
-  const profileToCamel = (row: any): Profile => ({
+  const profileToCamel = (row: any, streakCount: number = 0): Profile => ({
     id: row?.id,
     username: row?.username,
-    email: row?.email,
     xp: row?.xp ?? 0,
     level: row?.level ?? 1,
-    streak: row?.streak ?? 0,
+    streak: streakCount,
     lastActiveDate: row?.last_active_date,
     goal: row?.goal,
     blocker: row?.blocker,
     vibe: row?.vibe,
     avatarUrl: row?.avatar_url,
-    isPro: Boolean(row?.is_pro),
   });
 
   return {
@@ -812,11 +817,10 @@ function createSupabaseStore(): DataStore {
         return { status: 'ok', task };
       },
       async getProgress(userId) {
-        const { data: profile } = await sb()
-          .from('profiles')
-          .select('xp, streak')
-          .eq('id', userId)
-          .maybeSingle();
+        const [{ data: profile }, { data: streakRow }] = await Promise.all([
+          sb().from('profiles').select('xp').eq('id', userId).maybeSingle(),
+          sb().from('streaks').select('current_count').eq('user_id', userId).maybeSingle(),
+        ]);
         const since = new Date(Date.now() - 30 * 24 * 60 * 60 * 1000).toISOString().slice(0, 10);
         const { data: rows } = await sb()
           .from('daily_tasks')
@@ -831,14 +835,14 @@ function createSupabaseStore(): DataStore {
           skills[skill].total += 1;
           if (row.completed) skills[skill].completed += 1;
         }
-        return { xp: profile?.xp ?? 0, streak: profile?.streak ?? 0, skills };
+        return { xp: profile?.xp ?? 0, streak: Number(streakRow?.current_count ?? 0), skills };
       },
     },
     community: {
       async progress(userId) {
         const [{ data: saves }, { data: completions }] = await Promise.all([
-          sb().from('community_saves').select('teaching_id').eq('user_id', userId),
-          sb().from('community_completions').select('teaching_id').eq('user_id', userId),
+          sb().from('saved_teachings').select('teaching_id').eq('user_id', userId),
+          sb().from('teaching_completions').select('teaching_id').eq('user_id', userId),
         ]);
         return {
           saved: (saves ?? []).map((r: any) => `${userId}:${r.teaching_id}`),
@@ -847,13 +851,13 @@ function createSupabaseStore(): DataStore {
       },
       async save(userId, teachingId) {
         const { error } = await sb()
-          .from('community_saves')
+          .from('saved_teachings')
           .upsert({ user_id: userId, teaching_id: teachingId }, { onConflict: 'user_id,teaching_id' });
         if (error) throw new ApiError(500, 'Failed to save teaching.');
       },
       async unsave(userId, teachingId) {
         const { error } = await sb()
-          .from('community_saves')
+          .from('saved_teachings')
           .delete()
           .eq('user_id', userId)
           .eq('teaching_id', teachingId);
@@ -861,7 +865,7 @@ function createSupabaseStore(): DataStore {
       },
       async react(userId, teachingId, reaction) {
         const { error } = await sb()
-          .from('community_reactions')
+          .from('teaching_reactions')
           .insert({ user_id: userId, teaching_id: teachingId, reaction });
         if (isUniqueViolation(error)) return 'already';
         if (error) throw new ApiError(500, 'Failed to record reaction.');
@@ -869,7 +873,7 @@ function createSupabaseStore(): DataStore {
       },
       async complete(userId, teachingId, xp) {
         const { error } = await sb()
-          .from('community_completions')
+          .from('teaching_completions')
           .insert({ user_id: userId, teaching_id: teachingId, xp_awarded: xp });
         if (isUniqueViolation(error)) return 'already';
         if (error) throw new ApiError(500, 'Failed to complete teaching.');
@@ -879,9 +883,10 @@ function createSupabaseStore(): DataStore {
     },
     profile: {
       async get(userId) {
-        const [{ data: row }, { data: auditRows }] = await Promise.all([
+        const [{ data: row }, { data: auditRows }, { data: streakRow }] = await Promise.all([
           sb().from('profiles').select('*').eq('id', userId).maybeSingle(),
           sb().from('profile_audits').select('*').eq('user_id', userId).order('created_at', { ascending: false }),
+          sb().from('streaks').select('current_count').eq('user_id', userId).maybeSingle(),
         ]);
         const profileAudits: ProfileAudit[] = (auditRows ?? []).map((a: any) => ({
           id: a.id,
@@ -890,7 +895,7 @@ function createSupabaseStore(): DataStore {
           analysis: a.analysis ?? {},
           createdAt: a.created_at,
         }));
-        return { profile: profileToCamel(row), audits: profileAudits };
+        return { profile: profileToCamel(row, Number(streakRow?.current_count ?? 0)), audits: profileAudits };
       },
       async update(userId, patch) {
         const { data: current } = await sb().from('profiles').select('*').eq('id', userId).maybeSingle();
@@ -1407,36 +1412,75 @@ async function dodoWebhookHandler(req: Request, res: Response): Promise<void> {
 // ============================================================================
 
 const app = express();
-app.set('trust proxy', 1); // required for correct client IPs behind proxies
+// Vercel routes requests through at least one proxy hop; for standalone
+// deploys behind a reverse proxy adjust TRUST_PROXY_HOPS if needed.
+const TRUST_PROXY_HOPS = Number(process.env.TRUST_PROXY_HOPS ?? (onVercel ? 1 : 0));
+app.set('trust proxy', TRUST_PROXY_HOPS);
 app.disable('x-powered-by');
+
+// Strict CSP for the SPA. Gemini is accessed server-side only (no connect to
+// googleapis from the browser), so the browser only needs to reach:
+//   - 'self'                for API and SPA assets
+//   - Supabase project      auth / realtime / REST
+//   - Dodo Payments         hosted checkout + customer portal (test + prod)
+//   - Google Fonts          typography
+//   - data: / blob:         images & avatar uploads previews
+// Inline styles are required by Tailwind's runtime (v4 uses inline styles for
+// some dynamic values); scripts are strictly 'self'.
+const cspDirectives = {
+  defaultSrc: ["'self'"],
+  baseUri: ["'self'"],
+  formAction: ["'self'"],
+  scriptSrc: ["'self'"],
+  styleSrc: ["'self'", "'unsafe-inline'", 'https://fonts.googleapis.com'],
+  imgSrc: ["'self'", 'data:', 'blob:', 'https://images.unsplash.com'],
+  fontSrc: ["'self'", 'data:', 'https://fonts.gstatic.com'],
+  connectSrc: [
+    "'self'",
+    'https://*.supabase.co',
+    'wss://*.supabase.co',
+    'https://test.checkout.dodopayments.com',
+    'https://checkout.dodopayments.com',
+    'https://test.dodopayments.com',
+    'https://dodopayments.com',
+  ],
+  frameSrc: [
+    'https://test.checkout.dodopayments.com',
+    'https://checkout.dodopayments.com',
+  ],
+  objectSrc: ["'none'"],
+  frameAncestors: ["'none'"],
+  upgradeInsecureRequests: isProd ? [] : null,
+};
 
 app.use(
   helmet({
-    // CSP is opt-in (ENABLE_CSP=true) so it can be tuned against the real
-    // deployed SPA without risking breakage. Everything else is on by default.
-    contentSecurityPolicy:
-      env.ENABLE_CSP === 'true'
-        ? {
-            directives: {
-              defaultSrc: ["'self'"],
-              scriptSrc: ["'self'"],
-              styleSrc: ["'self'", "'unsafe-inline'"],
-              imgSrc: ["'self'", 'data:', 'blob:'],
-              connectSrc: ["'self'", 'https:', 'wss:'],
-              fontSrc: ["'self'", 'data:'],
-              objectSrc: ["'none'"],
-              frameAncestors: ["'none'"],
-            },
-          }
-        : false,
+    contentSecurityPolicy: enableCsp ? { directives: cspDirectives as any, useDefaults: false } : false,
     crossOriginEmbedderPolicy: false,
-    crossOriginResourcePolicy: { policy: 'cross-origin' }, // don't break cross-origin images
+    crossOriginOpenerPolicy: { policy: 'same-origin' },
+    crossOriginResourcePolicy: { policy: 'cross-origin' },
+    strictTransportSecurity: isProd
+      ? { maxAge: 31536000, includeSubDomains: true, preload: true }
+      : false,
+    referrerPolicy: { policy: 'strict-origin-when-cross-origin' },
   }),
 );
 
 // Strict, allowlist-only CORS. Default (empty allowlist) = same-origin only,
-// which is the correct posture for the SPA served by this same server.
-const allowedOrigins = (env.CORS_ORIGINS ?? '').split(',').map((s) => s.trim()).filter(Boolean);
+// which is the correct posture for the SPA served by this same server. APP_URL
+// and any comma-separated CORS_ORIGINS are added automatically; VERCEL_URL is
+// included on preview deployments when present.
+const _appOrigin = (() => {
+  try { return process.env.APP_URL ? new URL(process.env.APP_URL).origin : null; } catch { return null; }
+})();
+const _vercelPreview = process.env.VERCEL_URL ? `https://${process.env.VERCEL_URL}` : null;
+const allowedOrigins = Array.from(
+  new Set(
+    [_appOrigin, _vercelPreview, ...(env.CORS_ORIGINS ?? '').split(',').map((s) => s.trim())].filter(
+      (v): v is string => Boolean(v) && /^https?:\/\//.test(v),
+    ),
+  ),
+);
 app.use((req: Request, res: Response, next: NextFunction) => {
   const origin = req.headers.origin;
   if (origin && allowedOrigins.includes(origin)) {
@@ -1444,6 +1488,7 @@ app.use((req: Request, res: Response, next: NextFunction) => {
     res.setHeader('Vary', 'Origin');
     res.setHeader('Access-Control-Allow-Headers', 'Authorization, Content-Type');
     res.setHeader('Access-Control-Allow-Methods', 'GET, POST, PATCH, PUT, DELETE, OPTIONS');
+    res.setHeader('Access-Control-Max-Age', '600');
     if (req.method === 'OPTIONS') return res.sendStatus(204);
   }
   next();
@@ -1473,8 +1518,16 @@ app.post(
 
 app.use(express.json({ limit: '20mb' }));
 
-// Rate limiting (in-memory; swap the store for Redis when running multiple
-// instances behind a load balancer — see express-rate-limit docs).
+// Rate limiting is IN-MEMORY per serverless instance. On Vercel each isolated
+// function invocation has its own token bucket, so these limits slow down
+// trivial abuse but do NOT provide distributed protection against a fleet of
+// requests. For that reason, sensitive actions (checkout, portal, coach) add
+// DATABASE-BACKED per-user locks and quotas in their handlers:
+//   - begin_dodo_checkout RPC     rejects more than 5 attempts per 15 minutes
+//                                 and serializes via pg_advisory_xact_lock
+//   - try_consume_coach_quota     atomic daily counter, race-free
+// A future production hardening step should front /api with a shared store
+// (e.g. Cloudflare WAF / Upstash Redis) before going live.
 const apiLimiter = rateLimit({
   windowMs: 15 * 60 * 1000,
   limit: 600,
@@ -1555,6 +1608,10 @@ const journalPatchSchema = z
   .refine((d) => d.title !== undefined || d.content !== undefined, { message: 'Nothing to update.' });
 
 const reactionSchema = z.object({ reaction: z.enum(['🔥', '💀', '💡', '❤️']) }).strict();
+const teachingIdSchema = z.string().min(3).max(80).regex(/^[a-z0-9-]+$/);
+const journalIdSchema = z.string().uuid().or(z.string().min(6).max(120));
+const taskIdSchema = z.string().min(6).max(200);
+const adminIdSchema = z.string().uuid();
 const featureFlagSchema = z
   .object({
     state: z.enum(['ON', 'OFF', 'BETA']),
@@ -1747,8 +1804,14 @@ app.get(
   '/api/community',
   ah(async (req, res) => {
     const userId = await getAuthenticatedUserId(req);
-    const category = typeof req.query.category === 'string' ? req.query.category.toUpperCase() : 'ALL';
-    const search = typeof req.query.search === 'string' ? req.query.search.toLowerCase() : '';
+    const category =
+      typeof req.query.category === 'string'
+        ? req.query.category.slice(0, 30).toUpperCase()
+        : 'ALL';
+    const search =
+      typeof req.query.search === 'string'
+        ? req.query.search.slice(0, 80).toLowerCase()
+        : '';
 
     const teachings = TEACHINGS.filter(
       (teaching) =>
@@ -2853,10 +2916,12 @@ async function callGeminiCoach(systemInstruction: string, contents: Content[]): 
 
   const ai = new GoogleGenAI({
     apiKey: GEMINI_API_KEY,
-    httpOptions: { headers: { 'User-Agent': 'aistudio-build' } },
+    httpOptions: { headers: { 'User-Agent': 'datings-lol/1.0' } },
   });
 
-  const candidateModels = ['gemini-3.8-flash', 'gemini-flash-latest', 'gemini-2.5-flash'];
+  // gemini-flash-latest is the stable alias; pin specific versions as fallbacks.
+  const candidateModels = ['gemini-2.5-flash', 'gemini-2.0-flash', 'gemini-flash-latest'];
+  const MAX_OUTPUT_TOKENS = 600; // enough for the COACH'S TAKE / DO THIS / TRY format
 
   for (const model of candidateModels) {
     try {
@@ -2867,7 +2932,7 @@ async function callGeminiCoach(systemInstruction: string, contents: Content[]): 
         ai.models.generateContent({
           model,
           contents,
-          config: { systemInstruction, temperature: 0.7, maxOutputTokens: 80 },
+          config: { systemInstruction, temperature: 0.7, maxOutputTokens: MAX_OUTPUT_TOKENS },
         }),
         timeout,
       ])) as any;
@@ -3039,8 +3104,11 @@ app.use((err: Error, req: Request, res: Response, _next: NextFunction) => {
   if (err instanceof SyntaxError && 'body' in err) {
     return res.status(400).json({ error: 'Invalid JSON body.' });
   }
-  (req as any).log?.error({ err }, 'unhandled error');
-  res.status(500).json({ error: 'Internal Server Error.' });
+  // Log full error server-side (pino is configured with redaction for secrets);
+  // never send stack traces or internal messages to the client.
+  const log = (req as any).log || logger;
+  log.error({ err }, 'unhandled error');
+  res.status(500).json({ error: 'Internal Server Error.', code: 'INTERNAL_ERROR' });
 });
 
 // ============================================================================

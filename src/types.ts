@@ -1,18 +1,18 @@
-export type AuthView = "signin" | "signup" | "forgot_password" | "forgot_username";
+export type AuthView = "signin" | "signup" | "forgot_password";
 export type AppTab = "today" | "coach" | "community" | "profile" | "admin";
 
+// Client-side view of the authenticated user, derived from Supabase session.
+// Supabase Auth is the source of truth — passwords, password resets, and
+// credential verification never touch this shape or localStorage.
 export interface AuthUser {
   id: string;
   username: string;
   email: string;
   name: string;
-  passwordHash: string;
   avatarUrl?: string;
   createdAt: string;
   lastLoginAt?: string;
   isPro?: boolean;
-  securityQuestion?: string;
-  securityAnswer?: string;
   profile?: UserProfile;
   progress?: UserProgress;
   messages?: ChatMessage[];
