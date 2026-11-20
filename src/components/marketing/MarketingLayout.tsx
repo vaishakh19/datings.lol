@@ -27,6 +27,20 @@ export const MarketingNav: React.FC<MarketingNavProps> = ({
     navigate(path);
   };
 
+  const followInternalLink = (event: React.MouseEvent<HTMLAnchorElement>, path: string) => {
+    if (
+      event.button !== 0 ||
+      event.metaKey ||
+      event.ctrlKey ||
+      event.shiftKey ||
+      event.altKey
+    ) {
+      return;
+    }
+    event.preventDefault();
+    go(path);
+  };
+
   const isActive = (path: string) =>
     path === "/blog" ? currentPath.startsWith("/blog") : currentPath === path;
 
@@ -34,8 +48,9 @@ export const MarketingNav: React.FC<MarketingNavProps> = ({
     <header className="sticky top-0 z-40 bg-[#FFFBEB]/90 backdrop-blur-md border-b-[3px] border-black">
       <div className="max-w-[1100px] mx-auto px-4 sm:px-6 h-[68px] flex items-center justify-between gap-3">
         {/* Brand */}
-        <button
-          onClick={() => go("/")}
+        <a
+          href="/"
+          onClick={(event) => followInternalLink(event, "/")}
           className="flex items-center gap-2 shrink-0 cursor-pointer"
           aria-label="datings.lol home"
         >
@@ -46,14 +61,15 @@ export const MarketingNav: React.FC<MarketingNavProps> = ({
           <span className="hidden md:inline text-[10px] font-black px-2 py-0.5 bg-[#FFE066] text-black border-[2px] border-black rounded-full">
             BETA
           </span>
-        </button>
+        </a>
 
         {/* Desktop links */}
         <nav className="hidden md:flex items-center gap-1">
           {NAV_LINKS.map((link) => (
-            <button
+            <a
               key={link.path}
-              onClick={() => go(link.path)}
+              href={link.path}
+              onClick={(event) => followInternalLink(event, link.path)}
               className={`px-4 py-2 rounded-full font-black text-[14px] border-[2.5px] transition-all ${
                 isActive(link.path)
                   ? "bg-[#FFE066] border-black brutal-shadow-sm translate-y-[-1px]"
@@ -61,7 +77,7 @@ export const MarketingNav: React.FC<MarketingNavProps> = ({
               }`}
             >
               {link.label}
-            </button>
+            </a>
           ))}
         </nav>
 
@@ -76,18 +92,20 @@ export const MarketingNav: React.FC<MarketingNavProps> = ({
             </button>
           ) : (
             <>
-              <button
-                onClick={() => go("/login")}
+              <a
+                href="/login"
+                onClick={(event) => followInternalLink(event, "/login")}
                 className="px-4 py-2.5 bg-white border-[2.5px] border-black rounded-full font-black text-[13px] uppercase hover:bg-[#FFE066] transition-colors"
               >
                 Log in
-              </button>
-              <button
-                onClick={() => go("/signup")}
+              </a>
+              <a
+                href="/signup"
+                onClick={(event) => followInternalLink(event, "/signup")}
                 className="flex items-center gap-1.5 px-5 py-2.5 bg-[#111] text-white border-[2.5px] border-black rounded-full font-black text-[13px] uppercase brutal-shadow-sm hover:translate-y-[-1px] transition-transform"
               >
                 Get started <ArrowRight size={15} strokeWidth={3} />
-              </button>
+              </a>
             </>
           )}
         </div>
@@ -187,12 +205,24 @@ export const MarketingFooter: React.FC<{ navigate: (path: string) => void }> = (
                 { label: "Manifesto", path: "/about" },
               ].map((l) => (
                 <li key={l.path + l.label}>
-                  <button
-                    onClick={() => navigate(l.path)}
+                  <a
+                    href={l.path}
+                    onClick={(event) => {
+                      if (
+                        event.button === 0 &&
+                        !event.metaKey &&
+                        !event.ctrlKey &&
+                        !event.shiftKey &&
+                        !event.altKey
+                      ) {
+                        event.preventDefault();
+                        navigate(l.path);
+                      }
+                    }}
                     className="hover:text-[#FFE066] transition-colors"
                   >
                     {l.label}
-                  </button>
+                  </a>
                 </li>
               ))}
             </ul>
@@ -206,12 +236,18 @@ export const MarketingFooter: React.FC<{ navigate: (path: string) => void }> = (
             <ul className="space-y-2 text-[14px] font-bold">
               {LEGAL_DOCS.map((doc) => (
                 <li key={doc.slug}>
-                  <button
-                    onClick={() => navigate(`/${doc.slug}`)}
+                  <a
+                    href={`/${doc.slug}`}
+                    onClick={(event) => {
+                      if (event.button === 0 && !event.metaKey && !event.ctrlKey && !event.shiftKey && !event.altKey) {
+                        event.preventDefault();
+                        navigate(`/${doc.slug}`);
+                      }
+                    }}
                     className="text-left hover:text-[#FFE066] transition-colors"
                   >
                     {doc.label}
-                  </button>
+                  </a>
                 </li>
               ))}
             </ul>
@@ -225,13 +261,19 @@ export const MarketingFooter: React.FC<{ navigate: (path: string) => void }> = (
             <ul className="grid grid-cols-1 sm:grid-cols-2 gap-x-6 gap-y-2 text-[13px] font-bold">
               {SORTED_ARTICLES.map((a) => (
                 <li key={a.slug}>
-                  <button
-                    onClick={() => navigate(`/blog/${a.slug}`)}
+                  <a
+                    href={`/blog/${a.slug}`}
+                    onClick={(event) => {
+                      if (event.button === 0 && !event.metaKey && !event.ctrlKey && !event.shiftKey && !event.altKey) {
+                        event.preventDefault();
+                        navigate(`/blog/${a.slug}`);
+                      }
+                    }}
                     className="text-left hover:text-[#FFE066] transition-colors leading-snug"
                   >
                     <span className="mr-1.5">{a.emoji}</span>
                     {a.title}
-                  </button>
+                  </a>
                 </li>
               ))}
               <li>
@@ -254,12 +296,18 @@ export const MarketingFooter: React.FC<{ navigate: (path: string) => void }> = (
             {LEGAL_DOCS.map((doc, i) => (
               <React.Fragment key={doc.slug}>
                 {i > 0 && <span className="text-white/25">·</span>}
-                <button
-                  onClick={() => navigate(`/${doc.slug}`)}
+                <a
+                  href={`/${doc.slug}`}
+                  onClick={(event) => {
+                    if (event.button === 0 && !event.metaKey && !event.ctrlKey && !event.shiftKey && !event.altKey) {
+                      event.preventDefault();
+                      navigate(`/${doc.slug}`);
+                    }
+                  }}
                   className="hover:text-[#FFE066] transition-colors"
                 >
                   {doc.label}
-                </button>
+                </a>
               </React.Fragment>
             ))}
           </div>

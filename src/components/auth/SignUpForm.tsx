@@ -56,6 +56,7 @@ export function SignUpForm({ onNavigate }: { onSuccess?: unknown; onNavigate: (v
             onChange={(e) => { setEmail(e.target.value); if (emailTaken) setEmailTaken(""); }}
             autoComplete="email"
             placeholder="you@example.com"
+            required
             className="w-full pl-10 pr-3 py-3 bg-white border-[2.5px] border-black rounded-xl text-[15px] font-bold text-[#111] placeholder:text-[#777] outline-none focus:ring-2 focus:ring-[#FFE066]"
           />
         </div>
@@ -73,6 +74,8 @@ export function SignUpForm({ onNavigate }: { onSuccess?: unknown; onNavigate: (v
               onChange={(e) => setPassword(e.target.value)}
               autoComplete="new-password"
               placeholder="At least 6 chars"
+              required
+              minLength={6}
               className="w-full pl-10 pr-10 py-3 bg-white border-[2.5px] border-black rounded-xl text-[15px] font-bold text-[#111] placeholder:text-[#777] outline-none focus:ring-2 focus:ring-[#FFE066]"
             />
             <button type="button" onClick={() => setShowPassword((value) => !value)} className="absolute right-3 top-3.5" aria-label={showPassword ? "Hide password" : "Show password"}>
@@ -89,6 +92,8 @@ export function SignUpForm({ onNavigate }: { onSuccess?: unknown; onNavigate: (v
             onChange={(e) => setConfirm(e.target.value)}
             autoComplete="new-password"
             placeholder="Repeat password"
+            required
+            minLength={6}
             className="w-full px-3.5 py-3 bg-white border-[2.5px] border-black rounded-xl text-[15px] font-bold text-[#111] placeholder:text-[#777] outline-none focus:ring-2 focus:ring-[#FFE066]"
           />
         </label>
