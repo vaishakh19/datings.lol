@@ -1,13 +1,13 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">
-  <url><loc>https://datings.lol/</loc><changefreq>weekly</changefreq><priority>1</priority><lastmod>2026-10-17</lastmod></url>
-  <url><loc>https://datings.lol/about</loc><changefreq>weekly</changefreq><priority>0.7</priority><lastmod>2026-10-17</lastmod></url>
-  <url><loc>https://datings.lol/pricing</loc><changefreq>weekly</changefreq><priority>0.7</priority><lastmod>2026-10-17</lastmod></url>
-  <url><loc>https://datings.lol/blog</loc><changefreq>weekly</changefreq><priority>0.7</priority><lastmod>2026-10-17</lastmod></url>
-  <url><loc>https://datings.lol/terms</loc><changefreq>weekly</changefreq><priority>0.7</priority><lastmod>2026-10-17</lastmod></url>
-  <url><loc>https://datings.lol/privacy</loc><changefreq>weekly</changefreq><priority>0.7</priority><lastmod>2026-10-17</lastmod></url>
-  <url><loc>https://datings.lol/cookies</loc><changefreq>weekly</changefreq><priority>0.7</priority><lastmod>2026-10-17</lastmod></url>
-  <url><loc>https://datings.lol/disclaimer</loc><changefreq>weekly</changefreq><priority>0.7</priority><lastmod>2026-10-17</lastmod></url>
+  <url><loc>https://datings.lol/</loc><changefreq>weekly</changefreq><priority>1</priority></url>
+  <url><loc>https://datings.lol/about</loc><changefreq>weekly</changefreq><priority>0.7</priority></url>
+  <url><loc>https://datings.lol/pricing</loc><changefreq>weekly</changefreq><priority>0.7</priority></url>
+  <url><loc>https://datings.lol/blog</loc><changefreq>weekly</changefreq><priority>0.7</priority></url>
+  <url><loc>https://datings.lol/terms</loc><changefreq>weekly</changefreq><priority>0.7</priority></url>
+  <url><loc>https://datings.lol/privacy</loc><changefreq>weekly</changefreq><priority>0.7</priority></url>
+  <url><loc>https://datings.lol/cookies</loc><changefreq>weekly</changefreq><priority>0.7</priority></url>
+  <url><loc>https://datings.lol/disclaimer</loc><changefreq>weekly</changefreq><priority>0.7</priority></url>
   <url><loc>https://datings.lol/blog/openers-that-get-replies</loc><changefreq>monthly</changefreq><priority>0.6</priority><lastmod>2026-09-18</lastmod></url>
   <url><loc>https://datings.lol/blog/hey-is-killing-your-match-rate</loc><changefreq>monthly</changefreq><priority>0.6</priority><lastmod>2026-09-04</lastmod></url>
   <url><loc>https://datings.lol/blog/double-text-survival-guide</loc><changefreq>monthly</changefreq><priority>0.6</priority><lastmod>2026-09-11</lastmod></url>
